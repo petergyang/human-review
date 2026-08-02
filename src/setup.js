@@ -33,18 +33,20 @@ export const readSkill = () => fs.readFileSync(path.join(here, "skill.md"), "utf
 export const skillFor = (cmd) => readSkill().replaceAll("npx -y human-review", cmd);
 
 const CODEX_BLOCK = `
-## Reviewing HTML and Markdown with human-review
+## Reviewing files and localhost pages with human-review
 
 After writing an HTML or Markdown file the user will read, open it for them with
-\`npx -y human-review <file.html>\`, then block on
-\`npx -y human-review poll <file.html> --timeout 600\` until they send feedback.
+\`npx -y human-review <file.html>\`. For a locally running web page, open the real
+route with \`npx -y human-review http://localhost:3000/path\` instead of recreating
+it as a static file. Then block on
+\`npx -y human-review poll <target> --timeout 600\` until they send feedback.
 If it prints \`{"status":"timeout"}\`, no feedback arrived yet — run the same
 poll command again to keep waiting. When a \`{"status":"feedback"}\` batch
 arrives, apply it, then poll again with \`--ack\`.
 
 Keep the poll command in the foreground and do not end the turn while it waits.
 If the shell returns a process or session handle, keep waiting on that handle until
-the command exits. \`npx -y human-review status <file.html>\` reports instantly
+the command exits. \`npx -y human-review status <target>\` reports instantly
 whether feedback is already waiting, without blocking.
 
 The batch groups feedback by page under \`pages\`, so fix every page listed. Items
@@ -53,18 +55,29 @@ so carry it across verbatim and never revert it — and if the HTML was generate
 from MDX or Markdown, apply it to the source too. Markdown files open rendered
 and are never written by human-review: apply their comments and edits to the
 Markdown source, keeping its syntax. There is no reply channel; the user sees
-your work when the page reloads.
+your work when the page reloads. For a localhost page, direct edits and deletions
+arrive with \`kind: "url"\`; find and update the matching MDX, TSX, template, or
+component source. Never write the rendered HTTP response over project source.
 `;
 
-export function installSkills(cwd, { global: isGlobal = false } = {}) {
+export function installSkills(cwd, { global: isGlobal = false, home = os.homedir() } = {}) {
   const done = [];
   const cmd = invocation();
 
-  const base = isGlobal ? path.join(os.homedir(), ".claude") : path.join(cwd, ".claude");
-  const skillFile = path.join(base, "skills", "human-review", "SKILL.md");
-  fs.mkdirSync(path.dirname(skillFile), { recursive: true });
-  fs.writeFileSync(skillFile, skillFor(cmd));
-  done.push(`Claude Code skill  ${skillFile}${isGlobal ? "   (all projects)" : ""}`);
+  const skillRoots = isGlobal
+    ? [
+        ["Claude Code", path.join(home, ".claude")],
+        ["Codex", path.join(home, ".codex")],
+        ["Shared agents", path.join(home, ".agents")],
+      ]
+    : [["Claude Code", path.join(cwd, ".claude")]];
+
+  for (const [agent, base] of skillRoots) {
+    const skillFile = path.join(base, "skills", "human-review", "SKILL.md");
+    fs.mkdirSync(path.dirname(skillFile), { recursive: true });
+    fs.writeFileSync(skillFile, skillFor(cmd));
+    done.push(`${agent} skill  ${skillFile}${isGlobal ? "   (all projects)" : ""}`);
+  }
 
   if (!isGlobal) {
     const agents = path.join(cwd, "AGENTS.md");

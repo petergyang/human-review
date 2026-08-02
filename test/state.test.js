@@ -8,6 +8,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "human-review-test-"));
 process.env.HUMAN_REVIEW_STATE_DIR = path.join(tmp, "state");
 
 const { Store, resolveAsset } = await import("../src/state.js");
+const { canonicalTarget, localUrl, targetKey } = await import("../src/paths.js");
 
 function page(name, body) {
   const file = path.join(tmp, name);
@@ -71,6 +72,25 @@ test("pages are independent of one another", () => {
   store.addComment(a.key, { id: "x", feedback: "on a" });
   assert.equal(store.page(a.key).comments.length, 1);
   assert.equal(store.page(b.key).comments.length, 0);
+});
+
+test("localhost targets are canonical, durable, and distinct from files", () => {
+  assert.equal(localUrl("http://localhost:3000/wiki#section"), "http://localhost:3000/wiki");
+  assert.deepEqual(canonicalTarget("http://127.0.0.1:4000/plan"), {
+    kind: "url",
+    value: "http://127.0.0.1:4000/plan",
+  });
+  assert.throws(() => localUrl("https://example.com/wiki"), /limited to localhost/);
+
+  const store = new Store();
+  const opened = store.openUrl("http://localhost:3000/wiki#ignored");
+  assert.equal(opened.kind, "url");
+  assert.equal(opened.url, "http://localhost:3000/wiki");
+  assert.equal(opened.key, targetKey(opened.url));
+  assert.equal(store.pageForTarget(opened.url).key, opened.key);
+
+  const reloaded = new Store();
+  assert.equal(reloaded.page(opened.key).url, opened.url, "URL pages survive without a backing file");
 });
 
 test("stale pages and pages whose file vanished are pruned on load", () => {

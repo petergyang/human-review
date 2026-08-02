@@ -42,3 +42,14 @@ test("a page with only </html> gets the script before it", () => {
   const out = injectSdk("<html><h1>x</h1></html>", "k");
   assert.ok(out.indexOf("data-eh-sdk") < out.indexOf("</html>"));
 });
+
+test("localhost pages get an absolute base and sdk URL without stacking either", () => {
+  const options = { src: "http://127.0.0.1:4444/sdk.js?key=k", baseHref: "http://localhost:3000/wiki" };
+  const once = injectSdk(PAGE, "k", options);
+  const twice = injectSdk(once, "k", options);
+  assert.equal((twice.match(/<base[^>]*data-eh-sdk/g) || []).length, 1);
+  assert.equal((twice.match(/<script[^>]*data-eh-sdk/g) || []).length, 1);
+  assert.ok(twice.includes('href="http://localhost:3000/wiki"'));
+  assert.ok(twice.includes('src="http://127.0.0.1:4444/sdk.js?key=k"'));
+  assert.equal(stripSdk(twice), PAGE);
+});

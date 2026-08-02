@@ -1,11 +1,11 @@
 ---
 name: human-review
-description: Open an HTML or Markdown file in the browser so the user can edit the text directly and leave comments on specific parts, then send all their edits and comments back to you. Use after writing or updating any HTML or Markdown file the user will read — specs, plans, reports, newsletter drafts, landing pages, slide decks.
+description: Open an HTML file, Markdown file, or localhost page in the browser so the user can edit text directly and leave comments on specific parts, then send all edits and comments back to you. Use after writing or updating something the user will read — specs, plans, reports, newsletter drafts, landing pages, slide decks, and locally running web pages.
 ---
 
 # human-review
 
-The user reviews your HTML or Markdown in a real browser: they fix small things
+The user reviews your HTML, Markdown, or localhost page in a real browser: they fix small things
 by typing, select anything to comment on it, and send you the whole batch at once.
 
 Markdown files open rendered. Their quotes and edits reference the rendered text,
@@ -14,11 +14,18 @@ keeping its formatting syntax.
 
 ## The loop
 
-1. Write or update the HTML or Markdown file.
+1. Write or update the HTML or Markdown file, or start the local page being reviewed.
 2. Open it for the user:
 
    ```sh
    npx -y human-review path/to/file.html
+   ```
+
+   For a page served by a local development server, open the real route instead
+   of recreating it as a separate HTML file:
+
+   ```sh
+   npx -y human-review http://localhost:3000/wiki
    ```
 
 3. Wait for feedback. This blocks until they hit Send, or the timeout passes:
@@ -53,7 +60,7 @@ plus counts of unsent comments and edits still in the browser.
 
 ## What you get
 
-One batch covers every page the user visited, grouped by file.
+One batch covers every page the user visited, grouped by file or localhost URL.
 
 ```json
 {
@@ -83,6 +90,11 @@ One batch covers every page the user visited, grouped by file.
   carry it across verbatim and never revert it. If the HTML was generated from
   something else (MDX, Markdown, a template), apply `after` to the **source** too,
   or their fix disappears on the next build.
+- A page with `kind: "url"` was edited directly in the review UI. Its `file`
+  and `url` fields name the localhost route, not a writable file. Find the
+  matching project source (such as MDX, TSX, or a template), apply every edit
+  and deletion there, then acknowledge so the route reloads. Never write the
+  rendered HTTP response back into the app.
 - Find each comment by its `quote`; that exact string is in the file.
 - `kind: "element"` points at a whole block, so `quote` is its label, not body text.
 - Fix every page in `pages`, not just the first.

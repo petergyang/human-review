@@ -9,3 +9,6 @@ node_modules/
 # Claude Design runtime, not part of the product
 design-ref/support.js
 videos/
+
+# Local launch and review artifacts
+output/

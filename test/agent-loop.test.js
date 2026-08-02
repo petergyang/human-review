@@ -96,6 +96,7 @@ let server;
 
 test("poll --timeout exits cleanly with a timeout status", async () => {
   server = await waitForServer();
+  assert.equal(server.protocol, 2);
   const result = await collect(cli("poll", file, "--timeout", "1"));
   assert.equal(result.code, 0, result.stderr);
   const out = JSON.parse(result.stdout);

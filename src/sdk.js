@@ -6,7 +6,7 @@
  * talks to the server — everything crosses to the chrome page by postMessage.
  */
 import { buildContext, findQuote } from "./anchor-text.js";
-import { serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
+import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 
 const SAVE_DEBOUNCE_MS = 700;
 const EDIT_FLUSH_MS = 500;
@@ -493,7 +493,10 @@ function boot() {
   `;
   document.head.appendChild(style);
 
-  document.body.contentEditable = "true";
+  // React/Next.js hydration may remove an attribute that was added after the
+  // server rendered the page. Keep edit mode on after hydration settles so a
+  // real app stays directly editable, not just its initial HTML response.
+  keepBodyEditable(document.body);
   document.body.spellcheck = false;
   baseline = serialize();
   bootSnapshot = baseline;

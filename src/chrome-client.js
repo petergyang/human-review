@@ -267,6 +267,11 @@ function render() {
 
 function renderSave() {
   const line = $("saveLine");
+  if (state.page && state.page.kind === "url") {
+    line.className = "save-line dynamic";
+    $("saveText").textContent = "Localhost page — your direct edits go to the agent for source updates";
+    return;
+  }
   if (state.page && state.page.markdown) {
     line.className = "save-line dynamic";
     $("saveText").textContent = "Markdown source — edits go to the agent as feedback";
@@ -371,8 +376,8 @@ window.addEventListener("message", async (event) => {
         toFrame({ type: "eh:restoreScroll", x: state.scroll.x, y: state.scroll.y });
         state.reloading = false;
       }
-      if (state.page && state.page.markdown) {
-        // Rendered markdown: the file on disk is source, never to be saved over.
+      if (state.page && (state.page.markdown || state.page.feedbackOnly)) {
+        // Rendered sources are editable here but never serialized over their source.
         toFrame({ type: "eh:feedbackOnly" });
       } else {
         // Hand the SDK the on-disk HTML so it can spot self-rendering pages.

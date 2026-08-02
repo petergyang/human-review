@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Store, resolveAsset } from "./state.js";
 import { injectSdk, stripSdk } from "./html-transform.js";
 import { isMarkdown, renderMarkdownPage } from "./markdown.js";
-import { ensureStateDir, pageKey, realFile, serverPath } from "./paths.js";
+import { canonicalTarget, ensureStateDir, localUrl, SERVER_PROTOCOL, serverPath, targetKey } from "./paths.js";
 import { invocation, shellQuote } from "./setup.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -39,9 +39,30 @@ const WATCH_INTERVAL_MS = 400;
 const IDLE_SHUTDOWN_MS = Number(process.env.HUMAN_REVIEW_IDLE_MS || 45 * 60 * 1000);
 /** A window with no live connection this long is treated as closed for good. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
+const MAX_LOCAL_REDIRECTS = 5;
 
 const hash = (text) => crypto.createHash("sha1").update(text).digest("hex");
 const uid = (prefix) => `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
+
+async function fetchLocalPage(target, redirects = 0) {
+  const url = localUrl(target);
+  const response = await fetch(url, {
+    redirect: "manual",
+    headers: { accept: "text/html,application/xhtml+xml" },
+  });
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.get("location");
+    if (!location) throw new Error(`Localhost returned redirect ${response.status} without a location.`);
+    if (redirects >= MAX_LOCAL_REDIRECTS) throw new Error("Too many redirects while loading the localhost page.");
+    return fetchLocalPage(new URL(location, url).href, redirects + 1);
+  }
+  if (!response.ok) throw new Error(`Localhost returned ${response.status} for ${url}`);
+  const contentType = response.headers.get("content-type") || "";
+  if (!/html|xhtml/i.test(contentType)) {
+    throw new Error(`Expected an HTML page from localhost, but received ${contentType || "an unknown content type"}.`);
+  }
+  return { html: await response.text(), resolvedUrl: response.url || url };
+}
 
 export function createServer() {
   const store = new Store();
@@ -110,7 +131,7 @@ export function createServer() {
   function watchPage(key) {
     if (watched.has(key)) return;
     const page = store.page(key);
-    if (!page) return;
+    if (!page || page.kind === "url") return;
     watched.set(key, { file: page.file });
 
     fs.watchFile(page.file, { interval: WATCH_INTERVAL_MS }, () => {
@@ -132,6 +153,7 @@ export function createServer() {
   function writePage(key, html) {
     const page = store.page(key);
     if (!page) throw new Error("unknown page");
+    if (page.kind === "url") throw new Error("localhost pages are applied through their source files");
     const clean = stripSdk(html);
     const tmp = `${page.file}.human-review.tmp`;
     fs.writeFileSync(tmp, clean);
@@ -153,7 +175,7 @@ export function createServer() {
     return true;
   }
 
-  /** Every page you left feedback on ships in one batch, grouped by file. */
+  /** Every page you left feedback on ships in one batch, grouped by target. */
   function collectPages(session) {
     const out = [];
     for (const key of session.visited) {
@@ -162,7 +184,9 @@ export function createServer() {
       if (!page.comments.length && !page.edits.length) continue;
       out.push({
         key,
-        file: page.file,
+        kind: page.kind === "url" ? "url" : "file",
+        file: page.kind === "url" ? page.url : page.file,
+        url: page.kind === "url" ? page.url : undefined,
         comments: page.comments.map((c) => ({
           id: c.id,
           kind: c.kind,
@@ -180,7 +204,11 @@ export function createServer() {
   function otherPages(session) {
     return collectPages(session)
       .filter((p) => p.key !== session.activeKey)
-      .map((p) => ({ key: p.key, filename: path.basename(p.file), count: p.comments.length + p.edits.length }));
+      .map((p) => ({
+        key: p.key,
+        filename: p.kind === "url" ? new URL(p.url).pathname || p.url : path.basename(p.file),
+        count: p.comments.length + p.edits.length,
+      }));
   }
 
   function sendBatch(sessionId, note) {
@@ -190,19 +218,24 @@ export function createServer() {
     const pages = collectPages(session);
     if (!pages.length && !note) return { error: "nothing to send" };
 
-    const hasMarkdown = pages.some((p) => isMarkdown(p.file));
+    const hasMarkdown = pages.some((p) => p.kind === "file" && isMarkdown(p.file));
+    const hasUrl = pages.some((p) => p.kind === "url");
     const batch = {
       status: "feedback",
-      pages: pages.map(({ file, comments, edits }) => ({ file, comments, edits })),
+      pages: pages.map(({ kind, file, url, comments, edits }) => ({ kind, file, ...(url ? { url } : {}), comments, edits })),
       overall_note: note || "",
       sent_at: new Date().toISOString(),
       next_step:
-        "Apply this feedback. Each entry in `pages` names the file it belongs to. Items under `edits` are " +
+        "Apply this feedback. Each entry in `pages` names the reviewed file or localhost URL. Items under `edits` are " +
         "changes the human already made: `after` is their exact new wording, so carry it across verbatim, and " +
         "never revert it. " +
         (hasMarkdown
           ? "Markdown pages were reviewed rendered, so quotes and `after` wording use the rendered text — apply " +
             "the change to the Markdown source, keeping its formatting syntax. "
+          : "") +
+        (hasUrl
+          ? "Localhost pages were edited directly in the review UI. Find the matching project source (such as MDX or TSX) " +
+            "and apply every exact edit or deletion there; never try to write the rendered HTML response back to the app. "
           : "") +
         "When every page is updated, run the same poll command again with --ack to clear this " +
         "batch and wait for more.",
@@ -227,6 +260,13 @@ export function createServer() {
     store.clearBatch(entryKey);
     for (const { key, ids } of pending.cleanup) store.clearSent(key, ids);
     for (const session of sessionsForEntry(entryKey)) emit(session, "refresh", {});
+    // File targets reload through fs.watch. URL targets have no source file to
+    // watch, so acknowledgement is the signal to fetch the rebuilt route.
+    for (const { key } of pending.cleanup) {
+      if (store.page(key)?.kind === "url") {
+        for (const session of sessionsForKey(key)) emit(session, "reload", { key });
+      }
+    }
     broadcastAgent(entryKey);
     return true;
   }
@@ -288,18 +328,22 @@ export function createServer() {
   function pageState(key, session) {
     const page = store.page(key);
     if (!page) return null;
-    // The entry file is what the agent polls, even after navigating elsewhere.
+    // The entry target is what the agent polls, even after navigating elsewhere.
     const entry = session ? store.page(session.entryKey) : null;
-    const pollFile = entry ? entry.file : page.file;
+    const currentTarget = page.kind === "url" ? page.url : page.file;
+    const pollTarget = entry ? (entry.kind === "url" ? entry.url : entry.file) : currentTarget;
     return {
       key: page.key,
-      file: page.file,
-      filename: path.basename(page.file),
-      markdown: isMarkdown(page.file),
+      kind: page.kind === "url" ? "url" : "file",
+      file: currentTarget,
+      ...(page.kind === "url" ? { url: page.url } : {}),
+      filename: page.kind === "url" ? new URL(page.url).pathname || page.url : path.basename(page.file),
+      markdown: page.kind !== "url" && isMarkdown(page.file),
+      feedbackOnly: page.kind === "url",
       comments: page.comments,
       edits: page.edits,
-      canRevert: typeof page.pristine === "string" && page.pristine.length > 0,
-      pollCommand: `${invocation()} poll ${shellQuote(pollFile)}`,
+      canRevert: page.kind !== "url" && typeof page.pristine === "string" && page.pristine.length > 0,
+      pollCommand: `${invocation()} poll ${shellQuote(pollTarget)}`,
     };
   }
 
@@ -319,7 +363,7 @@ export function createServer() {
         return res.end("Forbidden");
       }
 
-      if (route === "/health") return json(res, 200, { ok: true, pid: process.pid });
+      if (route === "/health") return json(res, 200, { ok: true, pid: process.pid, protocol: SERVER_PROTOCOL });
 
       // Every API route needs the per-run token; static assets and the
       // unguessable /s/<id> chrome page do not.
@@ -335,14 +379,21 @@ export function createServer() {
       if (route === "/anchor-text.js") return serveFile(res, path.join(here, "anchor-text.js"), CORS);
       if (route === "/serialize.js") return serveFile(res, path.join(here, "serialize.js"), CORS);
 
-      // --- open a browser session for a file
+      // --- open a browser session for a file or localhost URL
       if (route === "/api/session" && req.method === "POST") {
         const body = await readBody(req);
-        const file = realFile(body.file || "");
-        if (!fs.existsSync(file)) return json(res, 404, { error: `File not found: ${file}` });
-        const html = fs.readFileSync(file, "utf8");
-        const page = store.openPage(file, stripSdk(html));
-        lastWritten.set(page.key, hash(stripSdk(html)));
+        const target = canonicalTarget(body.target || body.file || "");
+        let page;
+        if (target.kind === "url") {
+          // Fail during open with a useful message rather than opening a blank review.
+          await fetchLocalPage(target.value);
+          page = store.openUrl(target.value);
+        } else {
+          if (!fs.existsSync(target.value)) return json(res, 404, { error: `File not found: ${target.value}` });
+          const html = fs.readFileSync(target.value, "utf8");
+          page = store.openPage(target.value, stripSdk(html));
+          lastWritten.set(page.key, hash(stripSdk(html)));
+        }
         watchPage(page.key);
         const id = uid("s");
         sessions.set(id, { id, entryKey: page.key, activeKey: page.key, visited: new Set([page.key]), clients: new Set(), lastSeen: Date.now() });
@@ -354,7 +405,7 @@ export function createServer() {
         const id = route.slice(3);
         if (!sessions.has(id)) {
           res.writeHead(404, { "content-type": "text/plain" });
-          return res.end("This review session has ended. Run human-review <file> again.");
+          return res.end("This review session has ended. Run human-review <target> again.");
         }
         seen(sessions.get(id));
         const shell = fs.readFileSync(path.join(here, "chrome.html"), "utf8");
@@ -362,7 +413,7 @@ export function createServer() {
         return res.end(shell.replace("__SESSION_ID__", id).replace("__TOKEN__", token));
       }
 
-      // --- the artifact itself, plus its sibling assets
+      // --- the reviewed page itself, plus sibling assets for file targets
       if (route.startsWith("/artifact/")) {
         const rest = route.slice("/artifact/".length);
         const slash = rest.indexOf("/");
@@ -375,16 +426,35 @@ export function createServer() {
         }
         if (!asset || asset === "index.html") {
           let html = "";
-          try {
-            html = fs.readFileSync(page.file, "utf8");
-          } catch {
-            res.writeHead(404, { "content-type": "text/plain" });
-            return res.end("File is gone");
+          let sdkOptions = {};
+          if (page.kind === "url") {
+            try {
+              const fetched = await fetchLocalPage(page.url);
+              html = fetched.html;
+              sdkOptions = {
+                baseHref: fetched.resolvedUrl,
+                src: `http://${host}/sdk.js?key=${encodeURIComponent(key)}`,
+              };
+            } catch (err) {
+              res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+              return res.end(`Could not load ${page.url}: ${err.message}`);
+            }
+          } else {
+            try {
+              html = fs.readFileSync(page.file, "utf8");
+            } catch {
+              res.writeHead(404, { "content-type": "text/plain" });
+              return res.end("File is gone");
+            }
+            // Markdown reviews render on the fly; the source file stays untouched.
+            if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
           }
-          // Markdown reviews render on the fly; the source file stays untouched.
-          if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
           res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" });
-          return res.end(injectSdk(html, key));
+          return res.end(injectSdk(html, key, sdkOptions));
+        }
+        if (page.kind === "url") {
+          res.writeHead(404, { "content-type": "text/plain" });
+          return res.end("Localhost assets load from the reviewed development server.");
         }
         const target = resolveAsset(page.file, asset.split("?")[0]);
         if (!target) {
@@ -396,7 +466,7 @@ export function createServer() {
 
       // --- agent status probe: is feedback waiting? is anyone listening?
       if (route === "/api/status" && req.method === "GET") {
-        const entryKey = pageKey(url.searchParams.get("file") || "");
+        const entryKey = targetKey(url.searchParams.get("target") || url.searchParams.get("file") || "");
         const pending = batches.get(entryKey);
         const listening = (pollers.get(entryKey) || new Set()).size > 0;
         // Unsent feedback lives on every page reachable from this entry.
@@ -440,6 +510,9 @@ export function createServer() {
         // The file as it sits on disk, so the SDK can tell whether the page's
         // own scripts have already rewritten the live DOM.
         if (action === "raw" && req.method === "GET") {
+          if (store.page(key).kind === "url") {
+            return json(res, 400, { error: "localhost pages do not have a writable raw file" });
+          }
           let html = "";
           try {
             html = fs.readFileSync(store.page(key).file, "utf8");
@@ -479,9 +552,10 @@ export function createServer() {
         }
 
         if (action === "save" && req.method === "POST") {
-          // A markdown file must never be overwritten with serialized HTML.
-          if (isMarkdown(store.page(key).file)) {
-            return json(res, 400, { error: "markdown pages are feedback-only" });
+          const page = store.page(key);
+          // Rendered sources must never be overwritten with serialized browser HTML.
+          if (page.kind === "url" || isMarkdown(page.file)) {
+            return json(res, 400, { error: page.kind === "url" ? "localhost edits must be applied to app source" : "markdown pages are feedback-only" });
           }
           const body = await readBody(req);
           if (typeof body.html !== "string" || !body.html.trim()) {
@@ -497,6 +571,7 @@ export function createServer() {
 
         if (action === "revert" && req.method === "POST") {
           const page = store.page(key);
+          if (page.kind === "url") return json(res, 400, { error: "localhost pages have no directly writable file to revert" });
           if (!page.pristine) return json(res, 400, { error: "nothing to revert to" });
           writePage(key, page.pristine);
           store.clearEdits(key);
@@ -538,7 +613,7 @@ export function createServer() {
         return json(res, 200, { key: body.key });
       }
 
-      // --- navigation between local pages inside one window
+      // --- navigation between local files or localhost routes in one window
       const navMatch = route.match(/^\/api\/session\/(\w+)\/navigate$/);
       if (navMatch && req.method === "POST") {
         const session = sessions.get(navMatch[1]);
@@ -547,12 +622,22 @@ export function createServer() {
         const body = await readBody(req);
         const from = store.page(session.activeKey);
         if (!from) return json(res, 404, { error: "unknown page" });
-        const target = resolveAsset(from.file, String(body.href || "").split(/[?#]/)[0]);
-        if (!target || !fs.existsSync(target) || !/\.(x?html?|md|markdown)$/i.test(target)) {
+        if (from.kind === "url") {
+          const nextUrl = new URL(String(body.href || ""), from.url).href;
+          const target = canonicalTarget(nextUrl);
+          if (target.kind !== "url") return json(res, 400, { error: "not a localhost route" });
+          await fetchLocalPage(target.value);
+          const page = store.openUrl(target.value);
+          session.activeKey = page.key;
+          session.visited.add(page.key);
+          return json(res, 200, { key: page.key, page: pageState(page.key) });
+        }
+        const targetFile = resolveAsset(from.file, String(body.href || "").split(/[?#]/)[0]);
+        if (!targetFile || !fs.existsSync(targetFile) || !/\.(x?html?|md|markdown)$/i.test(targetFile)) {
           return json(res, 400, { error: "not a local html or markdown page" });
         }
-        const html = fs.readFileSync(target, "utf8");
-        const page = store.openPage(target, stripSdk(html));
+        const html = fs.readFileSync(targetFile, "utf8");
+        const page = store.openPage(targetFile, stripSdk(html));
         lastWritten.set(page.key, hash(stripSdk(html)));
         watchPage(page.key);
         session.activeKey = page.key;
@@ -587,8 +672,8 @@ export function createServer() {
 
       // --- the agent long-poll
       if (route === "/api/poll") {
-        const file = url.searchParams.get("file") || "";
-        const entryKey = pageKey(file);
+        const target = url.searchParams.get("target") || url.searchParams.get("file") || "";
+        const entryKey = targetKey(target);
         if (url.searchParams.get("ack") === "1") ack(entryKey);
 
         const pending = batches.get(entryKey);
@@ -664,7 +749,7 @@ export function start(port = 0) {
     server.listen(port, "127.0.0.1", () => {
       const actual = server.address().port;
       ensureStateDir();
-      fs.writeFileSync(serverPath(), JSON.stringify({ port: actual, pid: process.pid, token }));
+      fs.writeFileSync(serverPath(), JSON.stringify({ port: actual, pid: process.pid, token, protocol: SERVER_PROTOCOL }));
       try {
         fs.chmodSync(serverPath(), 0o600);
       } catch {

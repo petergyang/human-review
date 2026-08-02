@@ -4,7 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { ensureStateDir, pageKey, realFile, serverPath, statePath } from "./paths.js";
+import { canonicalTarget, ensureStateDir, SERVER_PROTOCOL, serverPath, statePath, targetKey } from "./paths.js";
 import { installSkills, shellQuote } from "./setup.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -12,15 +12,15 @@ const pkg = JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "u
 
 const HELP = `human-review ${pkg.version}
 
-  human-review <file.html>            Open a file for review in your browser
-  human-review poll <file.html>       Wait for feedback, print it as JSON (for agents)
+  human-review <file-or-localhost-url> Open a file or localhost page for review
+  human-review poll <target>          Wait for feedback, print it as JSON (for agents)
       --ack                        Acknowledge the last batch, then keep waiting
       --timeout <secs>             Exit with {"status":"timeout"} if nothing arrives
-  human-review status <file.html>     Report whether feedback is waiting, without blocking
+  human-review status <target>        Report whether feedback is waiting, without blocking
   human-review setup                  Teach Claude Code / Codex how to use human-review
   human-review setup --global         ...for every project, not just this one
 
-Everything runs locally. No account, no database, no network.
+Everything runs locally. No account, no cloud, no database.
 `;
 
 // --------------------------------------------------------------- server glue
@@ -72,7 +72,7 @@ async function alive(port) {
 async function ensureServer() {
   ensureStateDir();
   const saved = readServerRecord();
-  if (saved && saved.port && (await alive(saved.port))) return saved;
+  if (saved?.protocol === SERVER_PROTOCOL && saved.port && (await alive(saved.port))) return saved;
 
   const child = spawn(process.execPath, [path.join(here, "server-entry.js")], {
     detached: true,
@@ -101,14 +101,14 @@ function openBrowser(url) {
 
 // ------------------------------------------------------------------ commands
 
-async function openCommand(file) {
-  const target = realFile(file);
-  if (!fs.existsSync(target)) {
-    console.error(`File not found: ${target}`);
+async function openCommand(input) {
+  const target = canonicalTarget(input);
+  if (target.kind === "file" && !fs.existsSync(target.value)) {
+    console.error(`File not found: ${target.value}`);
     process.exit(1);
   }
   const server = await ensureServer();
-  const res = await request(server, { method: "POST", path: "/api/session", headers: { "content-type": "application/json" } }, { file: target });
+  const res = await request(server, { method: "POST", path: "/api/session", headers: { "content-type": "application/json" } }, { target: target.value });
   const body = JSON.parse(res.raw);
   if (res.status !== 200) {
     console.error(body.error || "Could not open that file.");
@@ -116,17 +116,17 @@ async function openCommand(file) {
   }
   const url = `http://127.0.0.1:${server.port}${body.path}`;
   openBrowser(url);
-  console.log(`Reviewing ${path.basename(target)}`);
+  console.log(`Reviewing ${target.kind === "url" ? target.value : path.basename(target.value)}`);
   console.log(url);
-  console.log(`\nWaiting for feedback? Run:\n  human-review poll ${shellQuote(target)}`);
+  console.log(`\nWaiting for feedback? Run:\n  human-review poll ${shellQuote(target.value)}`);
 }
 
 /**
  * One long-poll attempt. Resolves { kind: "data", raw } when the server
  * answers, or { kind: "timeout" } when the caller's deadline passes first.
  */
-function pollOnce(server, file, ack, timeoutMs) {
-  const query = `file=${encodeURIComponent(file)}${ack ? "&ack=1" : ""}`;
+function pollOnce(server, target, ack, timeoutMs) {
+  const query = `target=${encodeURIComponent(target)}${ack ? "&ack=1" : ""}`;
   return new Promise((resolve, reject) => {
     let done = false;
     const settle = (fn, value) => {
@@ -168,16 +168,17 @@ function printTimeout(waitedSecs) {
     status: "timeout",
     waited_seconds: waitedSecs,
     next_step:
-      "No feedback yet. Run the same poll command again to keep waiting, or `human-review status <file>` to check without blocking.",
+      "No feedback yet. Run the same poll command again to keep waiting, or `human-review status <target>` to check without blocking.",
   };
   process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
 }
 
-async function pollCommand(file, { ack = false, timeoutSecs = 0 } = {}) {
-  const target = realFile(file);
+async function pollCommand(input, { ack = false, timeoutSecs = 0 } = {}) {
+  const target = canonicalTarget(input).value;
   const server = await ensureServer();
 
-  process.stderr.write(`Waiting for feedback on ${path.basename(target)} — comment in the browser, then hit Send.\n`);
+  const label = /^https?:\/\//i.test(target) ? target : path.basename(target);
+  process.stderr.write(`Waiting for feedback on ${label} — comment in the browser, then hit Send.\n`);
 
   const deadline = timeoutSecs ? Date.now() + timeoutSecs * 1000 : null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -209,11 +210,11 @@ async function pollCommand(file, { ack = false, timeoutSecs = 0 } = {}) {
  * otherwise reads the persisted state directly, so a dead server still
  * reports feedback that is waiting for a fresh poll.
  */
-async function statusCommand(file) {
-  const target = realFile(file);
+async function statusCommand(input) {
+  const target = canonicalTarget(input).value;
   const saved = readServerRecord();
-  if (saved && saved.port && (await alive(saved.port))) {
-    const res = await request(saved, { method: "GET", path: `/api/status?file=${encodeURIComponent(target)}` });
+  if (saved?.protocol === SERVER_PROTOCOL && saved.port && (await alive(saved.port))) {
+    const res = await request(saved, { method: "GET", path: `/api/status?target=${encodeURIComponent(target)}` });
     if (res.status === 200) {
       process.stdout.write(`${JSON.stringify(JSON.parse(res.raw), null, 2)}\n`);
       return;
@@ -226,7 +227,7 @@ async function statusCommand(file) {
   } catch {
     // No state yet: everything below reads as empty.
   }
-  const key = pageKey(target);
+  const key = targetKey(target);
   const pending = (data.batches || {})[key];
   const page = (data.pages || {})[key];
   const payload = {
@@ -279,11 +280,11 @@ function parsePollArgs(rest) {
 try {
   if (argv[0] === "poll") {
     const { file, ack, timeoutSecs } = parsePollArgs(argv.slice(1));
-    if (!file) throw new Error("Usage: human-review poll <file.html> [--ack] [--timeout <secs>]");
+    if (!file) throw new Error("Usage: human-review poll <file-or-localhost-url> [--ack] [--timeout <secs>]");
     await pollCommand(file, { ack, timeoutSecs });
   } else if (argv[0] === "status") {
     const file = argv.find((a, i) => i > 0 && !a.startsWith("-"));
-    if (!file) throw new Error("Usage: human-review status <file.html>");
+    if (!file) throw new Error("Usage: human-review status <file-or-localhost-url>");
     await statusCommand(file);
   } else if (argv[0] === "setup") {
     const isGlobal = argv.includes("--global") || argv.includes("-g");

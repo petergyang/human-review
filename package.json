@@ -1,8 +1,16 @@
 {
   "name": "human-review",
-  "version": "0.3.0",
-  "description": "Review and edit agent-generated HTML and Markdown in the browser, then send the whole batch back to your agent.",
+  "version": "0.4.0",
+  "description": "Review and edit agent-generated files and localhost pages in the browser, then send the whole batch back to your agent.",
   "author": "Peter Yang",
+  "homepage": "https://github.com/petergyang/human-review#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/petergyang/human-review.git"
+  },
+  "bugs": {
+    "url": "https://github.com/petergyang/human-review/issues"
+  },
   "type": "module",
   "bin": {
     "human-review": "src/cli.js"
@@ -22,6 +30,8 @@
   "keywords": [
     "html",
     "markdown",
+    "localhost",
+    "nextjs",
     "review",
     "comments",
     "agent",
@@ -30,6 +40,9 @@
     "cli"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "jsdom": "^30.0.1"
   },
