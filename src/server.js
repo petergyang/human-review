@@ -427,7 +427,11 @@ export function createServer() {
       // it were same-origin.
       const host = String(req.headers.host || "");
       const port = req.socket.localPort;
-      if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) {
+      const allowedHosts = (process.env.HUMAN_REVIEW_ALLOWED_HOSTS || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}` && !allowedHosts.includes(host)) {
         res.writeHead(403, { "content-type": "text/plain" });
         return res.end("Forbidden");
       }
@@ -486,8 +490,15 @@ export function createServer() {
         }
         seen(sessions.get(id));
         const shell = fs.readFileSync(path.join(here, "chrome.html"), "utf8");
+        const artifactHost = process.env.HUMAN_REVIEW_ARTIFACT_HOST
+          || (host.startsWith("127.0.0.1") ? "localhost" : "127.0.0.1");
         res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" });
-        return res.end(shell.replace("__SESSION_ID__", id).replace("__TOKEN__", token));
+        return res.end(
+          shell
+            .replace("__SESSION_ID__", id)
+            .replace("__TOKEN__", token)
+            .replace("__ARTIFACT_HOST__", artifactHost)
+        );
       }
 
       // --- the reviewed page itself, plus sibling assets for file targets
@@ -527,7 +538,7 @@ export function createServer() {
             if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
           }
           res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" });
-          return res.end(injectSdk(html, key, sdkOptions));
+          return res.end(injectSdk(html, key, { ...sdkOptions, chromeOrigin: process.env.HUMAN_REVIEW_CHROME_ORIGIN }));
         }
         if (page.kind === "url") {
           res.writeHead(404, { "content-type": "text/plain" });
@@ -862,7 +873,7 @@ export function start(port = 0) {
       console.error(`human-review server could not listen on port ${port}: ${err.message}`);
       reject(err);
     });
-    server.listen(port, "127.0.0.1", () => {
+    server.listen(port, process.env.HUMAN_REVIEW_HOST || "127.0.0.1", () => {
       const actual = server.address().port;
       ensureStateDir();
       fs.writeFileSync(serverPath(), JSON.stringify({ port: actual, pid: process.pid, token, protocol: SERVER_PROTOCOL }));

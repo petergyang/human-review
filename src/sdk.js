@@ -15,9 +15,12 @@ const EDIT_FLUSH_MS = 500;
 const MEDIA = /^(img|svg|canvas|video|picture|iframe|hr|figure)$/i;
 
 // The chrome page lives on the other loopback hostname (a separate origin, so
-// the reviewed document can never touch it directly). Address it explicitly so
-// nothing we post can be read by any other embedder.
-const CHROME_ORIGIN = `${location.protocol}//${location.hostname === "127.0.0.1" ? "localhost" : "127.0.0.1"}:${location.port}`;
+// the reviewed document can never touch it directly). When the review is
+// served over a real host (e.g. Tailscale), the server injects the chrome
+// origin explicitly via data-chrome-origin on the SDK script tag.
+const CHROME_ORIGIN =
+  document.querySelector("script[data-eh-sdk]")?.dataset.chromeOrigin ||
+  `${location.protocol}//${location.hostname === "127.0.0.1" ? "localhost" : "127.0.0.1"}:${location.port}`;
 
 const post = (type, payload) => parent.postMessage({ ...payload, type }, CHROME_ORIGIN);
 

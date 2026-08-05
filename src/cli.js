@@ -115,7 +115,8 @@ async function openCommand(input) {
     console.error(body.error || "Could not open that file.");
     process.exit(1);
   }
-  const url = `http://127.0.0.1:${server.port}${body.path}`;
+  const publicHost = process.env.HUMAN_REVIEW_PUBLIC_URL || `http://127.0.0.1:${server.port}`;
+  const url = `${publicHost}${body.path}`;
   openBrowser(url);
   console.log(`Reviewing ${target.kind === "url" ? target.value : path.basename(target.value)}`);
   console.log(url);

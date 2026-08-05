@@ -59,9 +59,11 @@ async function api(path, options) {
   return res.json();
 }
 
-// Keep the reviewed app on a different loopback origin from the review shell.
-// This gives route-aware frameworks a real origin without exposing the parent UI.
-const ARTIFACT_HOST = location.hostname === "127.0.0.1" ? "localhost" : "127.0.0.1";
+// Keep the reviewed app on a different origin from the review shell (two
+// loopback names on desktop; an env-provided host like a Tailscale DNS name
+// when the shell is served over the network). This gives route-aware
+// frameworks a real origin without exposing the parent UI.
+const ARTIFACT_HOST = document.body.dataset.artifactHost || (location.hostname === "127.0.0.1" ? "localhost" : "127.0.0.1");
 const ARTIFACT_ORIGIN = `${location.protocol}//${ARTIFACT_HOST}:${location.port}`;
 
 // URL reviews keep a real origin. File reviews use an opaque sandbox origin,
@@ -713,14 +715,23 @@ $("note").addEventListener("input", (event) => {
 
 $("handle").addEventListener("click", () => {
   const collapsed = document.body.classList.toggle("collapsed");
-  const handle = $("handle");
-  handle.textContent = collapsed ? "‹" : "›";
-  handle.title = collapsed ? "Show comments panel" : "Hide comments panel";
-  handle.setAttribute("aria-label", handle.title);
+  syncHandle();
   try {
     localStorage.setItem("human-review:collapsed", collapsed ? "1" : "0");
   } catch {}
 });
+
+/** Match the toggle glyph to the current layout: side arrows for the desktop
+ * rail, up/down arrows for the mobile bottom sheet. */
+function syncHandle() {
+  const handle = $("handle");
+  const collapsed = document.body.classList.contains("collapsed");
+  const desktop = window.matchMedia("(min-width: 900px)").matches;
+  handle.textContent = collapsed ? (desktop ? "‹" : "▲") : (desktop ? "›" : "▼");
+  handle.title = collapsed ? "Show comments panel" : "Hide comments panel";
+  handle.setAttribute("aria-label", handle.title);
+}
+window.matchMedia("(min-width: 900px)").addEventListener("change", syncHandle);
 
 $("theme").addEventListener("click", () => {
   const dark = document.documentElement.dataset.theme !== "dark";
@@ -803,6 +814,7 @@ function connect() {
   try {
     applyTheme(localStorage.getItem("human-review:theme") === "dark");
     if (localStorage.getItem("human-review:collapsed") === "1") $("handle").click();
+    syncHandle();
   } catch {}
 
   const bootstrap = await api(`/api/session/${state.sessionId}/page`).catch(() => null);
