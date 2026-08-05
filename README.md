@@ -48,9 +48,12 @@ Review a page running on localhost:
 
 Human Review opens the file in your browser. Make direct edits, leave comments, and click Send. Your agent receives all your feedback in one batch, updates the source, and refreshes the page for another review.
 
+Note: For HTML files, direct edits and resizes save automatically. For Markdown and localhost pages, click Send so your agent can apply them to the source.
+
 ## What this skill lets you do
 
-- **Edit text directly** in an HTML or Markdown file.
+- **Edit text directly and tweak basic formatting** (e.g., bold, italic).
+- **Resize images** by dragging their corner.
 - **Select a phrase and leave a comment** anchored to the exact text.
 - **Comment on an image, chart, or section** by clicking the element.
 - **Remove elements** without explaining the deletion in chat.
