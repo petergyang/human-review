@@ -53,6 +53,7 @@ Note: For HTML files, direct edits and resizes save automatically. For Markdown 
 ## What this skill lets you do
 
 - **Edit text directly and tweak basic formatting** (e.g., bold, italic).
+- **Make bulleted and numbered lists** — type `- ` or `1. ` on an empty line, or press ⌘⇧8 / ⌘⇧7. Tab and Shift+Tab indent and outdent.
 - **Resize images** by dragging their corner.
 - **Select a phrase and leave a comment** anchored to the exact text.
 - **Comment on an image, chart, or section** by clicking the element.

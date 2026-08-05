@@ -736,6 +736,12 @@ function boot() {
   // beforeinput still sees the untouched wording, so capture it once per block.
   const originalText = new WeakMap();
   const originalHtml = new WeakMap();
+  const captureOriginal = (el) => {
+    if (!originalText.has(el)) {
+      originalText.set(el, el.textContent);
+      originalHtml.set(el, blockHtml(el));
+    }
+  };
   document.addEventListener(
     "beforeinput",
     (event) => {
@@ -744,9 +750,70 @@ function boot() {
       userEdited = true;
       const sel = document.getSelection();
       const target = targetFor(sel && sel.anchorNode ? sel.anchorNode : event.target);
-      if (target && !originalText.has(target.el)) {
-        originalText.set(target.el, target.el.textContent);
-        originalHtml.set(target.el, blockHtml(target.el));
+      if (target) captureOriginal(target.el);
+    },
+    true
+  );
+
+  // ------------------------------------------------------------------ lists
+
+  const LIST_MARKER = /^(?:[-*]|\d+\.)$/;
+
+  // execCommand mutations fire `input` (so edit rows and saves flow as usual)
+  // but not `beforeinput`, so originals are captured here by hand.
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (isOurs(event.target)) return;
+      const meta = event.metaKey || event.ctrlKey;
+      const sel = document.getSelection();
+      const anchor = sel ? sel.anchorNode : null;
+
+      // ⌘⇧8 bulleted, ⌘⇧7 numbered — the shortcuts people know from Docs.
+      if (meta && event.shiftKey && (event.code === "Digit7" || event.code === "Digit8")) {
+        const target = targetFor(anchor || event.target);
+        if (!target) return;
+        event.preventDefault();
+        event.stopPropagation();
+        userEdited = true;
+        captureOriginal(target.el);
+        document.execCommand(event.code === "Digit7" ? "insertOrderedList" : "insertUnorderedList");
+        scheduleSave();
+        return;
+      }
+
+      // Tab indents and Shift+Tab outdents inside a list, instead of leaving the page.
+      if (event.key === "Tab" && anchor) {
+        const el = anchor.nodeType === 1 ? anchor : anchor.parentElement;
+        const item = el && el.closest ? el.closest("li") : null;
+        if (!item || isOurs(item)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        userEdited = true;
+        const target = targetFor(item);
+        if (target) captureOriginal(target.el);
+        document.execCommand(event.shiftKey ? "outdent" : "indent");
+        scheduleSave();
+        return;
+      }
+
+      // "- ", "* ", or "1. " at the start of an empty block becomes a list.
+      if (event.key === " " && sel && sel.isCollapsed && anchor) {
+        const target = targetFor(anchor);
+        const block = target ? target.el : null;
+        if (!block || (block.closest && block.closest("li, ul, ol"))) return;
+        const marker = block.textContent.trim();
+        if (!LIST_MARKER.test(marker)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        userEdited = true;
+        captureOriginal(block);
+        const range = document.createRange();
+        range.selectNodeContents(block);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand("delete");
+        document.execCommand(/^\d/.test(marker) ? "insertOrderedList" : "insertUnorderedList");
       }
     },
     true
