@@ -28,7 +28,7 @@ export function shellQuote(arg) {
 }
 
 /** The skill lives in its own markdown file so nothing needs escaping. */
-export const readSkill = () => fs.readFileSync(path.join(here, "skill.md"), "utf8");
+export const readSkill = () => fs.readFileSync(path.join(here, "SKILL.md"), "utf8");
 
 export const skillFor = (cmd) => readSkill().replaceAll("npx -y human-review", cmd);
 

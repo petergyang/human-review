@@ -69,7 +69,7 @@ I use Human Review to edit AI-generated plans, update landing pages, review loca
 - [`sdk.js`](src/sdk.js) handles editing, comments, highlights, and feedback.
 - [`chrome-client.js`](src/chrome-client.js) contains the visual review interface.
 - [`markdown.js`](src/markdown.js) renders Markdown files for review.
-- [`skill.md`](src/skill.md) teaches Claude Code, Codex, and other agents how to use Human Review.
+- [`SKILL.md`](src/SKILL.md) teaches Claude Code, Codex, and other agents how to use Human Review.
 
 Everything runs on your computer. Human Review doesn’t require an account, cloud service, database, or API key.
 
