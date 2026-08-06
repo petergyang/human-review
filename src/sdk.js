@@ -6,7 +6,7 @@
  * talks to the server — everything crosses to the chrome page by postMessage.
  */
 import { buildContext, findQuote } from "./anchor-text.js";
-import { navigationHref } from "./click-target.js";
+import { hashClickAction, navigationHref } from "./click-target.js";
 import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 
 const SAVE_DEBOUNCE_MS = 700;
@@ -620,7 +620,15 @@ function boot() {
           event.preventDefault();
           event.stopPropagation();
           if (/^(https?:)?\/\//i.test(href) || /^mailto:/i.test(href)) post("eh:external", { href: new URL(href, document.baseURI).href });
-          else if (href.startsWith("#")) document.querySelector(href)?.scrollIntoView({ behavior: "smooth" });
+          else if (href.startsWith("#")) {
+            const action = hashClickAction(href, location.hash);
+            if (action.kind === "scroll") {
+              const el = document.getElementById(action.id) || document.getElementsByName(action.id)[0] || document.body;
+              el.scrollIntoView({ behavior: "smooth" });
+            } else {
+              location.hash = action.hash;
+            }
+          }
           else {
             // This document is about to be torn down: anything still sitting in
             // the debounce windows must ship first or it is lost. Message order
