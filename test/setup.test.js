@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { installSkills, isNpxCachePath } from "../src/setup.js";
+import { installSkills, invocation, isNpxCachePath } from "../src/setup.js";
 
 test("global setup installs the skill for Claude Code, Codex, and shared agents", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "human-review-setup-"));
@@ -44,4 +44,14 @@ test("a binary from npm's _npx cache does not count as installed on PATH", () =>
 
   // `_npx` only counts as a path segment, never as a substring of one.
   assert.equal(isNpxCachePath("/Users/x/my_npx_tools/bin/human-review"), false);
+});
+
+test("the CLI lookup hides its child process window", () => {
+  let options;
+  invocation((_probe, _args, receivedOptions) => {
+    options = receivedOptions;
+    return { status: 1, stdout: "" };
+  });
+
+  assert.equal(options?.windowsHide, true);
 });
