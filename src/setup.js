@@ -11,22 +11,36 @@ const here = path.dirname(fileURLToPath(import.meta.url));
  * `npm link` puts `human-review` on PATH; otherwise fall back to npx, which only
  * resolves once the package is published.
  *
- * The probe has to discount its own npx run. `npx -y human-review setup --global`
- * puts this package on PATH for the duration of that one command, out of npm's
- * `_npx` cache, so a naive `which` succeeds and setup writes a bare
- * `human-review` into SKILL.md. That binary is gone the moment npx exits, and
- * every later agent invocation dies with "command not found".
+ * The probe has to discount its own runner. `npx -y human-review setup --global`
+ * puts this package on PATH for the length of that one command, and running
+ * setup inside a project that depends on human-review puts that project's
+ * `node_modules/.bin` there too. Either way a naive `which` succeeds and setup
+ * writes a bare `human-review` into a SKILL.md that is meant to work from any
+ * directory. The entry drops off PATH as soon as the runner exits, or stops
+ * resolving as soon as the agent runs from somewhere else.
  */
 export function invocation() {
   const probe = process.platform === "win32" ? "where" : "which";
   const found = spawnSync(probe, ["human-review"], { encoding: "utf8" });
   const resolved = found.status === 0 ? found.stdout.trim().split(/\r?\n/)[0].trim() : "";
-  return resolved && !isNpxCachePath(resolved) ? "human-review" : "npx -y human-review";
+  return resolved && !isTransientBin(resolved) ? "human-review" : "npx -y human-review";
 }
 
-/** True for a binary npm placed in its transient `_npx` cache for one command. */
-export function isNpxCachePath(binPath) {
-  return binPath.split(/[\\/]/).includes("_npx");
+/**
+ * True for a bin that exists only for one command or only inside one project.
+ * Every transient channel routes through a `node_modules` directory: `npx`,
+ * `pnpm dlx`, `yarn dlx`, `bunx`, and a plain project-local dependency. npm's
+ * npx cache additionally sits under `_npx`, which is worth keeping as its own
+ * check because npm may relocate the bin inside it. Durable installs resolve
+ * through a bin directory with neither segment: `npm i -g`, `npm link`, volta,
+ * nvm, asdf, and the pnpm and yarn globals.
+ *
+ * A durable path that happens to contain either segment degrades to the npx
+ * form, which always works, so the failure direction here is cosmetic.
+ */
+export function isTransientBin(binPath) {
+  const segments = binPath.split(/[\\/]/);
+  return segments.includes("_npx") || segments.includes("node_modules");
 }
 
 /**
