@@ -288,11 +288,14 @@ function render() {
   // --- send
   const otherTotal = others.reduce((sum, o) => sum + o.count, 0);
   const total = comments.length + edits.length + otherTotal;
+  // An overall note is sendable on its own — the server already accepts
+  // note-only batches; the button must not stay dead while one is typed.
+  const hasNote = $("note").value.trim().length > 0;
   const send = $("send");
   const delivered = state.agent === "working";
   const stranded = state.agent === "stranded";
   const busy = delivered || stranded || state.sent;
-  send.disabled = total === 0 || busy;
+  send.disabled = (total === 0 && !hasNote) || busy;
   send.textContent = delivered
     ? "Feedback delivered"
     : stranded
@@ -301,7 +304,9 @@ function render() {
         ? "Sent — waiting for agent"
         : total
           ? `Send ${total} to agent`
-          : "Nothing to send yet";
+          : hasNote
+            ? "Send note to agent"
+            : "Nothing to send yet";
   if (!send.disabled) {
     const key = document.createElement("span");
     key.className = "key";
@@ -698,6 +703,7 @@ $("note").addEventListener("input", (event) => {
   const el = event.target;
   el.style.height = "auto";
   el.style.height = `${Math.min(el.scrollHeight + 2, window.innerHeight * 0.4)}px`;
+  render(); // keep the send button in step with note-only feedback
 });
 
 $("handle").addEventListener("click", () => {
