@@ -10,11 +10,23 @@ const here = path.dirname(fileURLToPath(import.meta.url));
  * Teach agents the command that will actually work here. A global install or
  * `npm link` puts `human-review` on PATH; otherwise fall back to npx, which only
  * resolves once the package is published.
+ *
+ * The probe has to discount its own npx run. `npx -y human-review setup --global`
+ * puts this package on PATH for the duration of that one command, out of npm's
+ * `_npx` cache, so a naive `which` succeeds and setup writes a bare
+ * `human-review` into SKILL.md. That binary is gone the moment npx exits, and
+ * every later agent invocation dies with "command not found".
  */
 export function invocation() {
   const probe = process.platform === "win32" ? "where" : "which";
   const found = spawnSync(probe, ["human-review"], { encoding: "utf8" });
-  return found.status === 0 && found.stdout.trim() ? "human-review" : "npx -y human-review";
+  const resolved = found.status === 0 ? found.stdout.trim().split(/\r?\n/)[0].trim() : "";
+  return resolved && !isNpxCachePath(resolved) ? "human-review" : "npx -y human-review";
+}
+
+/** True for a binary npm placed in its transient `_npx` cache for one command. */
+export function isNpxCachePath(binPath) {
+  return binPath.split(/[\\/]/).includes("_npx");
 }
 
 /**

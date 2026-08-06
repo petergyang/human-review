@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { installSkills } from "../src/setup.js";
+import { installSkills, isNpxCachePath } from "../src/setup.js";
 
 test("global setup installs the skill for Claude Code, Codex, and shared agents", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "human-review-setup-"));
@@ -22,4 +22,26 @@ test("global setup installs the skill for Claude Code, Codex, and shared agents"
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("a binary from npm's _npx cache does not count as installed on PATH", () => {
+  // `npx -y human-review setup --global` resolves `which human-review` to the
+  // transient cache copy, which disappears when npx exits. Writing a bare
+  // `human-review` into SKILL.md on the strength of that leaves every later
+  // agent run failing with "command not found".
+  assert.equal(
+    isNpxCachePath("/Users/x/.npm/_npx/f043fcd613c7efad/node_modules/.bin/human-review"),
+    true,
+  );
+  assert.equal(
+    isNpxCachePath("C:\\Users\\x\\AppData\\Local\\npm-cache\\_npx\\a1b2\\human-review.cmd"),
+    true,
+  );
+
+  // A real global install or `npm link` must still win.
+  assert.equal(isNpxCachePath("/opt/homebrew/bin/human-review"), false);
+  assert.equal(isNpxCachePath("/usr/local/bin/human-review"), false);
+
+  // `_npx` only counts as a path segment, never as a substring of one.
+  assert.equal(isNpxCachePath("/Users/x/my_npx_tools/bin/human-review"), false);
 });
