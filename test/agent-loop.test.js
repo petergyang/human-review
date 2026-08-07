@@ -7,6 +7,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
+import { SERVER_PROTOCOL } from "../src/paths.js";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "human-review-loop-"));
 process.env.HUMAN_REVIEW_STATE_DIR = path.join(tmp, "state");
@@ -96,7 +97,7 @@ let server;
 
 test("poll --timeout exits cleanly with a timeout status", async () => {
   server = await waitForServer();
-  assert.equal(server.protocol, 6);
+  assert.equal(server.protocol, SERVER_PROTOCOL);
   const result = await collect(cli("poll", file, "--timeout", "1"));
   assert.equal(result.code, 0, result.stderr);
   const out = JSON.parse(result.stdout);

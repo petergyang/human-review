@@ -7,6 +7,7 @@
  */
 import { buildContext, findQuote } from "./anchor-text.js";
 import { hashClickAction, navigationHref } from "./click-target.js";
+import { listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
 import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 
 const SAVE_DEBOUNCE_MS = 700;
@@ -67,6 +68,16 @@ shadow.innerHTML = `
       font: 11px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       pointer-events: none;
     }
+    .linkbox {
+      position: fixed; z-index: 2147483647; display: none; gap: 4px; align-items: center;
+      padding: 5px; border: 1px solid #e4e2db; border-radius: 9px; background: #fff;
+      box-shadow: 0 4px 16px rgba(27,26,22,.16); pointer-events: auto;
+    }
+    .linkbox input {
+      width: 224px; padding: 4px 7px; border: none; outline: none; background: none;
+      font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1b1a16;
+    }
+    .linkbox input::placeholder { color: #a29f95; }
   </style>
   <div class="box outline" id="outline"></div>
   <div class="box active" id="activeBox"></div>
@@ -75,6 +86,11 @@ shadow.innerHTML = `
   </div>
   <div class="grip" id="grip" title="Drag to resize"></div>
   <div class="hint" id="hint"></div>
+  <div class="linkbox" id="linkbox">
+    <input id="linkInput" type="text" placeholder="Link to&hellip;" spellcheck="false">
+    <button class="chip" id="linkApply" title="Apply link (&#9166;)" aria-label="Apply link">&#8629;</button>
+    <button class="chip danger" id="linkRemove" title="Remove link" aria-label="Remove link">&#10005;</button>
+  </div>
 `;
 
 const els = {};
@@ -86,6 +102,10 @@ const mountOverlay = () => {
   els.chipDelete = shadow.getElementById("chipDelete");
   els.grip = shadow.getElementById("grip");
   els.hint = shadow.getElementById("hint");
+  els.linkbox = shadow.getElementById("linkbox");
+  els.linkInput = shadow.getElementById("linkInput");
+  els.linkApply = shadow.getElementById("linkApply");
+  els.linkRemove = shadow.getElementById("linkRemove");
 };
 
 function place(box, el, pad = 2) {
@@ -314,6 +334,50 @@ function targetFor(node) {
     pinnedLabels.set(block, heading ? `${clip(heading, 26)} · ${tag}${ordinal}` : clip(block.textContent, 40) || tag);
   }
   return { el: block, label: pinnedLabels.get(block), authored: false };
+}
+
+/**
+ * The nearest rendered block around a node, ignoring authored data-block
+ * containers. List conversion and drop targeting need the line the caret is
+ * actually on, not the labeled region it reports edits under.
+ */
+function innermostBlock(node) {
+  let el = node && node.nodeType === 1 ? node : node && node.parentElement;
+  while (el && el !== document.body && !isBlock(el)) el = el.parentElement;
+  return el && el !== document.body ? el : null;
+}
+
+/**
+ * After a list command: hoist the fresh list out of the paragraph Chrome
+ * sometimes nests it in (invalid HTML that a reparse would restructure), and
+ * make sure the page's CSS reset can't hide it.
+ */
+function polishNewList(sel) {
+  const node = sel && sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  const item = el && el.closest ? el.closest("li") : null;
+  const list = item ? item.closest("ul, ol") : null;
+  if (!list) return;
+  const wrap = list.parentElement;
+  if (wrap && /^(p|h[1-6])$/i.test(wrap.tagName) && wrap.childNodes.length === 1) {
+    wrap.replaceWith(list);
+  }
+  const patch = listStyleFixup(list.tagName, getComputedStyle(list));
+  if (patch.listStyleType) list.style.listStyleType = patch.listStyleType;
+  if (patch.paddingLeft) list.style.paddingLeft = patch.paddingLeft;
+}
+
+/** The caret position a drag at (x, y) would drop into. */
+function caretRangeAt(x, y) {
+  if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
+  if (document.caretPositionFromPoint) {
+    const pos = document.caretPositionFromPoint(x, y);
+    if (!pos) return null;
+    const range = document.createRange();
+    range.setStart(pos.offsetNode, pos.offset);
+    return range;
+  }
+  return null;
 }
 
 // ------------------------------------------------------------ serialization
@@ -664,7 +728,8 @@ function boot() {
     showChip(hoverTarget);
     showGrip(hoverMedia);
     const interactive = event.target.closest && event.target.closest("a[href], [data-href], button, [role='button']");
-    showHint(interactive ? "⌘-click to open" : "", event.clientX, event.clientY);
+    const draggable = hoverMedia && hoverMedia.tagName === "IMG";
+    showHint(interactive ? "⌘-click to open" : draggable ? "Drag to move" : "", event.clientX, event.clientY);
   });
 
   document.addEventListener("mouseleave", () => {
@@ -750,6 +815,21 @@ function boot() {
       originalHtml.set(el, blockHtml(el));
     }
   };
+
+  /** An edit row for a block changed outside the input-event flow (attribute
+   * set, link removal, drag move) — the same shape the input listener emits. */
+  const emitBlockEdit = (blockEl, fallbackLabel) => {
+    const connected = blockEl.isConnected;
+    const target = connected ? targetFor(blockEl) : null;
+    queueEdit({
+      label: (target && target.label) || fallbackLabel || "Document body",
+      kind: "edited",
+      before: originalText.get(blockEl),
+      after: connected ? blockEl.textContent : "",
+      before_html: originalHtml.get(blockEl),
+      after_html: connected ? blockHtml(blockEl) : "",
+    });
+  };
   document.addEventListener(
     "beforeinput",
     (event) => {
@@ -763,9 +843,125 @@ function boot() {
     true
   );
 
-  // ------------------------------------------------------------------ lists
+  // ------------------------------------------------------------------ links
 
-  const LIST_MARKER = /^(?:[-*]|\d+\.)$/;
+  let linkState = null; // { range, anchor, blockEl, label } while the ⌘K popup is open
+
+  function closeLinkbox(restoreSelection) {
+    if (!linkState) return;
+    const { range } = linkState;
+    linkState = null;
+    els.linkbox.style.display = "none";
+    if (restoreSelection && range) {
+      const sel = document.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.body.focus({ preventScroll: true });
+    }
+  }
+
+  function openLinkbox() {
+    const sel = document.getSelection();
+    if (!sel || !sel.rangeCount) return false;
+    let range = sel.getRangeAt(0).cloneRange();
+    const container = range.commonAncestorContainer;
+    if (!document.body.contains(container) || isOurs(container)) return false;
+
+    const caretEl = container.nodeType === 1 ? container : container.parentElement;
+    const anchor = caretEl && caretEl.closest ? caretEl.closest("a") : null;
+    if (sel.isCollapsed) {
+      // A bare caret can only mean "edit the link I'm inside".
+      if (!anchor) return false;
+      range = document.createRange();
+      range.selectNodeContents(anchor);
+    }
+    const target = targetFor(anchor || container);
+    linkState = {
+      range,
+      anchor,
+      blockEl: target ? target.el : null,
+      label: target ? target.label : "Document body",
+    };
+    if (linkState.blockEl) captureOriginal(linkState.blockEl);
+
+    // The compose card and the link popup fight over the same selection.
+    clearPending();
+    post("eh:dismiss", {});
+
+    const r = range.getBoundingClientRect();
+    const below = r.bottom + 44 < window.innerHeight;
+    els.linkbox.style.display = "flex";
+    els.linkbox.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - 320))}px`;
+    els.linkbox.style.top = `${below ? r.bottom + 8 : Math.max(8, r.top - 44)}px`;
+    els.linkRemove.style.display = anchor ? "" : "none";
+    els.linkInput.value = anchor ? anchor.getAttribute("href") || "" : "";
+    els.linkInput.focus();
+    els.linkInput.select();
+    return true;
+  }
+
+  function applyLink() {
+    if (!linkState) return;
+    const href = normalizeHref(els.linkInput.value);
+    const { range, anchor, blockEl, label } = linkState;
+    if (!href) {
+      // Nothing typed → dismiss. Something unusable typed → stay open so the
+      // input isn't silently thrown away.
+      if (!els.linkInput.value.trim()) closeLinkbox(true);
+      else els.linkInput.select();
+      return;
+    }
+    userEdited = true;
+    linkState = null;
+    els.linkbox.style.display = "none";
+    if (anchor && anchor.isConnected) {
+      // Editing an existing link never rewraps — just retarget it.
+      anchor.setAttribute("href", href);
+      if (blockEl) emitBlockEdit(blockEl, label);
+    } else {
+      const sel = document.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.body.focus({ preventScroll: true });
+      document.execCommand("createLink", false, href);
+    }
+    scheduleSave();
+  }
+
+  function removeLink() {
+    if (!linkState) return;
+    const { anchor, blockEl, label } = linkState;
+    linkState = null;
+    els.linkbox.style.display = "none";
+    if (!anchor || !anchor.isConnected) return;
+    userEdited = true;
+    const parent = anchor.parentNode;
+    while (anchor.firstChild) parent.insertBefore(anchor.firstChild, anchor);
+    parent.removeChild(anchor);
+    parent.normalize();
+    if (blockEl) emitBlockEdit(blockEl, label);
+    scheduleSave();
+  }
+
+  els.linkInput.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      event.preventDefault();
+      applyLink();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeLinkbox(true);
+    }
+  });
+  els.linkApply.addEventListener("click", applyLink);
+  els.linkRemove.addEventListener("click", removeLink);
+
+  // A click anywhere in the page means the popup lost the argument.
+  document.addEventListener("pointerdown", (event) => {
+    if (linkState && !isOurs(event.target)) closeLinkbox(false);
+  });
+
+  // ------------------------------------------------------------------ lists
 
   // execCommand mutations fire `input` (so edit rows and saves flow as usual)
   // but not `beforeinput`, so originals are captured here by hand.
@@ -777,6 +973,20 @@ function boot() {
       const sel = document.getSelection();
       const anchor = sel ? sel.anchorNode : null;
 
+      // ⌘K links the selection, like Docs, Word, and Notion.
+      if (meta && !event.shiftKey && !event.altKey && (event.key === "k" || event.key === "K")) {
+        if (openLinkbox()) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
+
+      if (event.key === "Escape" && linkState) {
+        closeLinkbox(true);
+        return;
+      }
+
       // ⌘⇧8 bulleted, ⌘⇧7 numbered — the shortcuts people know from Docs.
       if (meta && event.shiftKey && (event.code === "Digit7" || event.code === "Digit8")) {
         const target = targetFor(anchor || event.target);
@@ -786,6 +996,7 @@ function boot() {
         userEdited = true;
         captureOriginal(target.el);
         document.execCommand(event.code === "Digit7" ? "insertOrderedList" : "insertUnorderedList");
+        polishNewList(document.getSelection());
         scheduleSave();
         return;
       }
@@ -801,34 +1012,144 @@ function boot() {
         const target = targetFor(item);
         if (target) captureOriginal(target.el);
         document.execCommand(event.shiftKey ? "outdent" : "indent");
+        polishNewList(document.getSelection());
         scheduleSave();
         return;
       }
 
-      // "- ", "* ", or "1. " at the start of an empty block becomes a list.
+      // "- ", "* ", "1. ", or "1) " at the start of a line becomes a list.
+      // Only the text between the block's start and the caret matters, so this
+      // works inside authored data-block containers and in front of existing
+      // text — not just in blocks that hold nothing but the marker.
       if (event.key === " " && sel && sel.isCollapsed && anchor) {
+        const host = anchor.nodeType === 1 ? anchor : anchor.parentElement;
+        if (!host || host.closest("li, ul, ol")) return;
+        const block = innermostBlock(anchor);
+        // isBlock matches display:table but not table-cell, so a caret in a
+        // table's first cell resolves the whole table — never convert that.
+        if (block && /^(table|thead|tbody|tfoot|tr)$/i.test(block.tagName)) return;
+        const lead = document.createRange();
+        // Inline content directly under <body> (a bare text node beside an
+        // image, say) has no block; the caret's own node is the line then.
+        if (block) lead.selectNodeContents(block);
+        else lead.setStart(anchor, 0);
+        try {
+          lead.setEnd(sel.anchorNode, sel.anchorOffset);
+        } catch {
+          return;
+        }
+        const command = listCommandFor(lead.toString());
+        if (!command) return;
         const target = targetFor(anchor);
-        const block = target ? target.el : null;
-        if (!block || (block.closest && block.closest("li, ul, ol"))) return;
-        const marker = block.textContent.trim();
-        if (!LIST_MARKER.test(marker)) return;
         event.preventDefault();
         event.stopPropagation();
         userEdited = true;
-        captureOriginal(block);
-        const range = document.createRange();
-        range.selectNodeContents(block);
+        if (target) captureOriginal(target.el);
         sel.removeAllRanges();
-        sel.addRange(range);
+        sel.addRange(lead);
         document.execCommand("delete");
-        document.execCommand(/^\d/.test(marker) ? "insertOrderedList" : "insertUnorderedList");
+        document.execCommand(command);
+        polishNewList(document.getSelection());
+        scheduleSave();
       }
     },
     true
   );
 
+  // ------------------------------------------------------------- image drag
+
+  // Chromium moves an image dropped inside contenteditable on its own; this
+  // code only aims the drop (indicator outline), blocks payloads that have
+  // nowhere to go (files from the desktop), and writes the edit rows for the
+  // block the image left and the block it landed in.
+  let dragging = null; // { el, fromBlock, fromLabel, overBlock, dropped } during an image drag
+
+  document.addEventListener("dragstart", (event) => {
+    const img = event.target && event.target.nodeType === 1 && event.target.tagName === "IMG" ? event.target : null;
+    if (!img || isOurs(img)) return;
+    const target = targetFor(img);
+    if (target) captureOriginal(target.el);
+    dragging = {
+      el: img,
+      src: img.src,
+      // The rendered size often comes from the container being left behind
+      // (figure/card CSS); remember it so the move can't balloon the image.
+      width: img.getBoundingClientRect().width,
+      fromBlock: target ? target.el : null,
+      fromLabel: target ? target.label : "Image",
+      overBlock: null,
+      dropped: false,
+    };
+  });
+
+  document.addEventListener("dragover", (event) => {
+    if (!dragging) {
+      // External payloads would navigate the frame or paste file:// markup.
+      if (event.dataTransfer && [...(event.dataTransfer.types || [])].includes("Files")) {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "none";
+      }
+      return;
+    }
+    const range = caretRangeAt(event.clientX, event.clientY);
+    const block = range ? innermostBlock(range.startContainer) : null;
+    if (block && !isOurs(block)) {
+      captureOriginal(block);
+      dragging.overBlock = block;
+    }
+    place(els.outline, block && !isOurs(block) ? block : null);
+  });
+
+  const finalizeImageDrag = () => {
+    const drag = dragging;
+    if (!drag || !drag.dropped) return;
+    dragging = null;
+    place(els.outline, null);
+    // Chrome re-inserts a copy on drop, so find the landed image by source,
+    // then pin it to the size it had before the move — an image dragged out
+    // of the container that was constraining it would otherwise render at
+    // its natural size.
+    let landed = drag.el.isConnected ? drag.el : null;
+    if (!landed && drag.overBlock && drag.overBlock.isConnected) {
+      landed = [...drag.overBlock.querySelectorAll("img")].find((i) => i.src === drag.src) || null;
+    }
+    if (landed && drag.width && Math.abs(landed.getBoundingClientRect().width - drag.width) > 1) {
+      landed.style.width = `${Math.round(drag.width)}px`;
+      landed.style.height = "auto";
+      landed.style.maxWidth = "100%";
+    }
+    const rows = new Map();
+    if (drag.fromBlock) rows.set(drag.fromBlock, drag.fromLabel);
+    if (drag.overBlock && !rows.has(drag.overBlock)) rows.set(drag.overBlock, null);
+    for (const [block, label] of rows) emitBlockEdit(block, label);
+    scheduleSave();
+  };
+
+  document.addEventListener("drop", (event) => {
+    if (dragging) {
+      // The move itself is the drop's default action, so the edit rows can
+      // only be read after it has run.
+      userEdited = true;
+      dragging.dropped = true;
+      setTimeout(finalizeImageDrag, 0);
+      return;
+    }
+    if (event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files.length) event.preventDefault();
+  });
+
+  document.addEventListener("dragend", () => {
+    // A cancelled drag (Esc, or dropped outside the page) still needs cleanup.
+    if (dragging && !dragging.dropped) {
+      dragging = null;
+      place(els.outline, null);
+    }
+  });
+
   document.addEventListener("input", (event) => {
     if (isOurs(event.target)) return;
+    // A drop fires deleteByDrag/insertFromDrop input events whose selection
+    // points anywhere; finalizeImageDrag writes the real rows instead.
+    if (dragging) return;
     // Typing over a selection is an edit, not a comment: retire the card.
     if (pending) {
       clearPending();
@@ -854,6 +1175,8 @@ function boot() {
     place(els.outline, hoverTarget);
     showChip(hoverTarget);
     showGrip(resizing ? resizing.el : hoverMedia);
+    // The popup is viewport-fixed; scrolled away from its text it just lies.
+    if (linkState) closeLinkbox(false);
   };
   window.addEventListener("scroll", reposition, true);
   window.addEventListener("resize", reposition);
