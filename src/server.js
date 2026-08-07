@@ -44,6 +44,38 @@ const MAX_LOCAL_REDIRECTS = 5;
 const LOCAL_FETCH_TIMEOUT_MS = 30000;
 const MAX_LOCAL_PAGE_BYTES = 24 * 1024 * 1024;
 
+/**
+ * Normalize a host[:port] (or scheme://host[:port]/path) to a lowercase
+ * host:port string for origin comparison. Missing ports fall back to the
+ * server's own port (the artifact iframe always uses the shell's port).
+ */
+function originHostPort(hostPort, defaultPort) {
+  let s = String(hostPort || "").trim().toLowerCase();
+  s = s.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  const m = s.match(/^(\[[^\]]*\])(?::(\d+))?$/);
+  if (m) return `${m[1]}:${m[2] || defaultPort || ""}`;
+  const idx = s.lastIndexOf(":");
+  if (idx !== -1 && /^\d+$/.test(s.slice(idx + 1))) return `${s.slice(0, idx)}:${s.slice(idx + 1)}`;
+  return `${s}:${defaultPort || ""}`;
+}
+
+/** HTML error shown when the shell and artifact would share an origin. */
+function sameOriginError(shellOrigin) {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>human-review — same-origin config refused</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:640px;margin:48px auto;padding:0 20px;line-height:1.55">
+<h2 style="margin-bottom:8px">⚠️ Refusing to open: shell and artifact share an origin</h2>
+<p>The review shell is served from <code>${shellOrigin}</code> and <code>HUMAN_REVIEW_ARTIFACT_HOST</code> points at the <b>same</b> host. A URL-kind review keeps <code>allow-same-origin</code>, so the reviewed app's scripts would get full same-origin access to the parent shell — including the session token in <code>data-token</code>. The entire two-loopback design exists to prevent exactly this.</p>
+<p>Remote reviews need <b>two distinct hostnames</b> that both reach this machine, e.g. the Tailscale IP for the shell and the MagicDNS name for the artifact (or vice versa):</p>
+<pre style="background:#f6f6f6;padding:12px;border-radius:8px;overflow:auto">HUMAN_REVIEW_HOST=0.0.0.0
+HUMAN_REVIEW_ALLOWED_HOSTS=100.101.102.103:8124,my-laptop.tailnet-name.ts.net:8124
+HUMAN_REVIEW_PUBLIC_URL=http://100.101.102.103:8124
+HUMAN_REVIEW_ARTIFACT_HOST=my-laptop.tailnet-name.ts.net</pre>
+<p>Then open the shell via the <b>other</b> hostname. The localhost defaults (shell on <code>127.0.0.1</code>, artifact on <code>localhost</code>, or vice versa) are unaffected.</p>
+</body></html>`;
+}
+
 const hash = (text) => crypto.createHash("sha1").update(text).digest("hex");
 const uid = (prefix) => `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
 
@@ -492,6 +524,15 @@ export function createServer() {
         const shell = fs.readFileSync(path.join(here, "chrome.html"), "utf8");
         const artifactHost = process.env.HUMAN_REVIEW_ARTIFACT_HOST
           || (host.startsWith("127.0.0.1") ? "localhost" : "127.0.0.1");
+        // Security guard (review #1): the artifact iframe must live on a
+        // DIFFERENT origin from the shell. If both resolve to the same
+        // host:port, a URL-kind review (allow-same-origin) could read the
+        // session token off the shell — the two-loopback design exists to
+        // prevent exactly this. Refuse the token page with a clear error.
+        if (originHostPort(host, port) === originHostPort(artifactHost, port)) {
+          res.writeHead(500, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+          return res.end(sameOriginError(originHostPort(host, port)));
+        }
         res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" });
         return res.end(
           shell

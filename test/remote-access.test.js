@@ -89,4 +89,27 @@ test("remote phone access via env-configurable hosts", async (t) => {
     const stranger = await request(port, { route: "/health", headers: { host: `lan.example.com:${port}` } });
     assert.equal(stranger.status, 403);
   });
+
+  await t.test("same-origin artifact host is refused with a clear error", async () => {
+    process.env.HUMAN_REVIEW_ALLOWED_HOSTS = `same.example.com:${port}`;
+    process.env.HUMAN_REVIEW_ARTIFACT_HOST = "same.example.com";
+    t.after(() => { delete process.env.HUMAN_REVIEW_ALLOWED_HOSTS; delete process.env.HUMAN_REVIEW_ARTIFACT_HOST; });
+
+    const { path: sessionPath } = await openSession(port, token);
+    const shell = await request(port, { route: sessionPath, headers: { host: `same.example.com:${port}` } });
+    assert.equal(shell.status, 500);
+    assert.match(shell.raw, /two distinct hostnames/);
+    assert.match(shell.raw, /data-token/);   // names the actual risk
+  });
+
+  await t.test("two distinct hostnames serve the shell normally", async () => {
+    process.env.HUMAN_REVIEW_ALLOWED_HOSTS = `shell.example.com:${port}`;
+    process.env.HUMAN_REVIEW_ARTIFACT_HOST = "artifact.example.com";
+    t.after(() => { delete process.env.HUMAN_REVIEW_ALLOWED_HOSTS; delete process.env.HUMAN_REVIEW_ARTIFACT_HOST; });
+
+    const { path: sessionPath } = await openSession(port, token);
+    const shell = await request(port, { route: sessionPath, headers: { host: `shell.example.com:${port}` } });
+    assert.equal(shell.status, 200);
+    assert.match(shell.raw, /data-artifact-host="artifact\.example\.com"/);
+  });
 });
