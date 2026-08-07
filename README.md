@@ -50,6 +50,38 @@ Human Review opens the file in your browser. Make direct edits, leave comments, 
 
 Note: For HTML files, direct edits and resizes save automatically. For Markdown and localhost pages, click Send so your agent can apply them to the source.
 
+## Reviewing from another device (phone, LAN, Tailscale)
+
+By default human-review binds to `127.0.0.1` and serves the reviewed app from the *other* loopback name (`localhost` ↔ `127.0.0.1`). The shell and the reviewed page are deliberately **two different origins** — that's what stops the reviewed app's scripts from reading the session token off the shell.
+
+To review from a phone or another machine, configure both sides explicitly. **This is for private networks only (Tailscale / VPN / trusted LAN)** — see the exposure warning below.
+
+| Env var | Effect | Default |
+|---|---|---|
+| `HUMAN_REVIEW_HOST` | Server bind address | `127.0.0.1` |
+| `HUMAN_REVIEW_ALLOWED_HOSTS` | Comma-separated extra `Host`-header allowlist | loopback only |
+| `HUMAN_REVIEW_PUBLIC_URL` | URL printed/used for the session (e.g. `http://100.x.y.z:8124`); when set, the CLI skips auto-opening the browser | — |
+| `HUMAN_REVIEW_ARTIFACT_HOST` | Hostname the reviewed page's iframe loads from | the other loopback name |
+| `HUMAN_REVIEW_CHROME_ORIGIN` | Origin the SDK posts messages to (the shell) | auto-derived |
+
+⚠️ **You must use two distinct hostnames** for the shell and the artifact. If `HUMAN_REVIEW_ARTIFACT_HOST` resolves to the same origin as the shell, the reviewed app's scripts would gain same-origin access to the shell — including the session token. human-review refuses to serve the session in that case; the error page explains the requirement.
+
+Example (Tailscale): shell on the tailnet IP, artifact on the MagicDNS name:
+
+```sh
+HUMAN_REVIEW_HOST=0.0.0.0
+HUMAN_REVIEW_ALLOWED_HOSTS=100.101.102.103:8124,my-laptop.tailnet-name.ts.net:8124
+HUMAN_REVIEW_PUBLIC_URL=http://100.101.102.103:8124
+HUMAN_REVIEW_ARTIFACT_HOST=my-laptop.tailnet-name.ts.net
+human-review my-page.html
+```
+
+Open `http://100.101.102.103:8124/s/<id>` on your phone.
+
+> ⚠️ **Exposure model — private networks only.** With `HUMAN_REVIEW_HOST=0.0.0.0` the server is reachable by anyone who can reach the port *and* sends an allowed `Host` header. Token-free routes become network-readable: `/artifact/<key>/…` (keys are `sha256(realpath)` truncated to 16 hex chars, derivable from file paths) serves the reviewed page and sibling assets, and `/s/<id>` carries the session token over plain HTTP. On a private tailnet that's fine; on shared or public Wi-Fi it is **not** — anyone sniffing or on the network could read your reviewed files. Don't bind to `0.0.0.0` on untrusted networks.
+
+> ℹ️ Env vars are read by the server when it **starts**. If you already have a server running, stop it first before changing these values, or the old settings stay in effect. The detached server exits on its own after being idle (default 45 min, `HUMAN_REVIEW_IDLE_MS`) — or kill the stale one via its PID in `server.json` / Task Manager.
+
 ## What this skill lets you do
 
 - **Edit text directly and tweak basic formatting** (e.g., bold, italic).
