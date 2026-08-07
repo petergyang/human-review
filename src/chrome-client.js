@@ -5,6 +5,7 @@
  * hostname: a separate origin that can never reach this page or its token.
  */
 import { tidy } from "./anchor-text.js";
+import { pageUrl, replacePage } from "./chrome-session.js";
 import { framePolicy } from "./frame-policy.js";
 
 const $ = (id) => document.getElementById(id);
@@ -30,6 +31,17 @@ const state = {
   dynamic: false,
   framePolicy: null,
 };
+
+/**
+ * Most reviewers drive an agent from a chat (Claude Code, Codex, Cursor), not
+ * a bare terminal — so the handoff is a prompt the agent can act on, with the
+ * poll command embedded for anyone who does live in a shell.
+ */
+function handoffPrompt(pollCommand) {
+  const cmd = String(pollCommand || "").trim();
+  if (!cmd) return "";
+  return `Run \`${cmd} --timeout 600\`, apply the feedback it returns, then keep polling with --ack until I end the review.`;
+}
 
 // ------------------------------------------------------------------- server
 
@@ -84,10 +96,9 @@ function flushFrame() {
 async function loadPage(key, { reload = true } = {}) {
   const returning = state.page;
   state.key = key;
-  state.page = await api(`/api/page/${key}?session=${state.sessionId}`);
+  replacePage(state, await api(pageUrl(key, state.sessionId)));
   state.framePolicy = framePolicy(state.page, ARTIFACT_ORIGIN);
   frame.setAttribute("sandbox", state.framePolicy.sandbox);
-  state.others = state.page.others || [];
   state.orphans = new Set();
   state.compose = null;
   state.active = null;
@@ -316,7 +327,7 @@ function render() {
 
   // Server-authoritative, so it survives a browser refresh.
   $("handoff").hidden = !stranded;
-  if (stranded) $("handoffCmd").textContent = state.pollCommand || page.pollCommand || "";
+  if (stranded) $("handoffCmd").textContent = handoffPrompt(state.pollCommand || page.pollCommand);
 }
 
 function renderSave() {
@@ -687,10 +698,10 @@ $("handoffCopy").addEventListener("click", async (event) => {
     await navigator.clipboard.writeText($("handoffCmd").textContent);
     button.textContent = "Copied";
     setTimeout(() => {
-      button.textContent = "Copy command";
+      button.textContent = "Copy prompt";
     }, 1600);
   } catch {
-    toast("Couldn't copy — select the command and copy it manually");
+    toast("Couldn't copy — select the prompt and copy it manually");
   }
 });
 
@@ -761,8 +772,8 @@ function connect() {
     state.baseHash = null;
     clearTimeout(retryTimer);
     frame.src = artifactUrl(state.key, true);
-    api(`/api/page/${state.key}`).then((page) => {
-      state.page = page;
+    api(pageUrl(state.key, state.sessionId)).then((page) => {
+      replacePage(state, page);
       state.save = "idle";
       state.savedAt = "";
       render();
@@ -777,7 +788,7 @@ function connect() {
     render();
   });
   source.addEventListener("refresh", async () => {
-    state.page = await api(`/api/page/${state.key}`);
+    replacePage(state, await api(pageUrl(state.key, state.sessionId)));
     state.sent = false;
     render();
   });

@@ -57,6 +57,16 @@ test("the local server refuses strangers", async (t) => {
     assert.equal(res.status, 200);
   });
 
+  await t.test("browser modules imported by the review client are served", async () => {
+    const res = await request(port, { route: "/chrome-session.js" });
+    assert.equal(res.status, 200);
+    assert.match(res.raw, /export function replacePage/);
+    // sdk.js imports this at boot; if the route vanishes the editor never loads.
+    const editing = await request(port, { route: "/editing.js" });
+    assert.equal(editing.status, 200);
+    assert.match(editing.raw, /export function listCommandFor/);
+  });
+
   await t.test("a DNS-rebound host header is rejected everywhere", async () => {
     const res = await request(port, { route: "/health", headers: { host: "evil.example.com" } });
     assert.equal(res.status, 403);

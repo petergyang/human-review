@@ -449,7 +449,9 @@ export function createServer() {
       // --- static chrome assets
       if (route === "/chrome.css") return serveFile(res, path.join(here, "chrome.css"));
       if (route === "/chrome.js") return serveFile(res, path.join(here, "chrome-client.js"), CORS);
+      if (route === "/chrome-session.js") return serveFile(res, path.join(here, "chrome-session.js"), CORS);
       if (route === "/sdk.js") return serveFile(res, path.join(here, "sdk.js"), CORS);
+      if (route === "/editing.js") return serveFile(res, path.join(here, "editing.js"), CORS);
       if (route === "/anchor-text.js") return serveFile(res, path.join(here, "anchor-text.js"), CORS);
       if (route === "/frame-policy.js") return serveFile(res, path.join(here, "frame-policy.js"), CORS);
       if (route === "/click-target.js") return serveFile(res, path.join(here, "click-target.js"), CORS);
