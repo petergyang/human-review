@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { listCommandFor, listStyleFixup, normalizeHref } from "../src/editing.js";
+import { linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "../src/editing.js";
 
 test("list markers typed at the start of a line convert to the right list", () => {
   assert.equal(listCommandFor("-"), "insertUnorderedList");
@@ -50,6 +50,18 @@ test("in-page and relative references pass through untouched", () => {
   assert.equal(normalizeHref("/docs/setup"), "/docs/setup");
   assert.equal(normalizeHref("./page.html"), "./page.html");
   assert.equal(normalizeHref("docs/page.html"), "docs/page.html");
+});
+
+test("a link the page renders as plain prose gets an underline", () => {
+  const prose = { color: "rgb(34, 34, 34)" };
+  const resetLink = { textDecorationLine: "none", color: "rgb(34, 34, 34)" };
+  assert.deepEqual(linkStyleFixup(resetLink, prose), { textDecoration: "underline" });
+});
+
+test("a link the page already styles is left alone", () => {
+  const prose = { color: "rgb(34, 34, 34)" };
+  assert.deepEqual(linkStyleFixup({ textDecorationLine: "underline", color: "rgb(34, 34, 34)" }, prose), {});
+  assert.deepEqual(linkStyleFixup({ textDecorationLine: "none", color: "rgb(41, 95, 204)" }, prose), {});
 });
 
 test("executable and unknown schemes are rejected outright", () => {

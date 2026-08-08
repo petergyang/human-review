@@ -56,6 +56,8 @@ Note: For HTML files, direct edits and resizes save automatically. For Markdown 
 - **Make bulleted and numbered lists** — type `- ` or `1. ` at the start of a line, or press ⌘⇧8 / ⌘⇧7. Tab and Shift+Tab indent and outdent.
 - **Add links** — select text and press ⌘K. ⌘K inside an existing link edits or removes it.
 - **Resize images** by dragging their corner, and **move images** by dragging them to a new spot.
+- **Rearrange the page** — hover any block and drag the handle on its left edge to move the whole block somewhere else.
+- **Paste images** from your clipboard — they're saved into an `assets/` folder next to the file and inserted at your cursor.
 - **Select a phrase and leave a comment** anchored to the exact text.
 - **Comment on an image, chart, or section** by clicking the element.
 - **Remove elements** without explaining the deletion in chat.

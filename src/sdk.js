@@ -7,7 +7,7 @@
  */
 import { buildContext, findQuote } from "./anchor-text.js";
 import { hashClickAction, navigationHref } from "./click-target.js";
-import { listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
+import { linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
 import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 
 const SAVE_DEBOUNCE_MS = 700;
@@ -23,6 +23,7 @@ const post = (type, payload) => parent.postMessage({ ...payload, type }, CHROME_
 
 let pending = null; // { id, marks } for an uncommitted highlight
 let hoverTarget = null;
+let hoverMove = null; // the innermost block under the cursor, movable via the handle
 let hoverMedia = null; // the img/video under the cursor, resizable via the grip
 let resizing = null; // live drag state while the grip is held
 let suppressUntil = 0; // ignore the mouseup/click that ends a resize drag
@@ -78,6 +79,20 @@ shadow.innerHTML = `
       font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1b1a16;
     }
     .linkbox input::placeholder { color: #a29f95; }
+    .mover {
+      position: fixed; z-index: 2147483647; width: 18px; height: 24px;
+      display: none; align-items: center; justify-content: center;
+      border: 1px solid #e4e2db; border-radius: 6px; background: #fff; color: #a29f95;
+      font: 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      cursor: grab; pointer-events: auto; user-select: none;
+      box-shadow: 0 2px 8px rgba(27,26,22,.14);
+    }
+    .mover:hover { color: #1b1a16; border-color: #c2beb4; }
+    .mover:active { cursor: grabbing; }
+    .dropline {
+      position: fixed; z-index: 2147483646; height: 0; display: none;
+      border-top: 2px solid #1b1a16; border-radius: 1px; pointer-events: none;
+    }
   </style>
   <div class="box outline" id="outline"></div>
   <div class="box active" id="activeBox"></div>
@@ -91,6 +106,8 @@ shadow.innerHTML = `
     <button class="chip" id="linkApply" title="Apply link (&#9166;)" aria-label="Apply link">&#8629;</button>
     <button class="chip danger" id="linkRemove" title="Remove link" aria-label="Remove link">&#10005;</button>
   </div>
+  <div class="mover" id="mover" title="Drag to move this block">&#10303;</div>
+  <div class="dropline" id="dropline"></div>
 `;
 
 const els = {};
@@ -106,7 +123,38 @@ const mountOverlay = () => {
   els.linkInput = shadow.getElementById("linkInput");
   els.linkApply = shadow.getElementById("linkApply");
   els.linkRemove = shadow.getElementById("linkRemove");
+  els.mover = shadow.getElementById("mover");
+  els.dropline = shadow.getElementById("dropline");
 };
+
+function showMover(el) {
+  if (!el || !el.isConnected) {
+    els.mover.style.display = "none";
+    return;
+  }
+  const r = el.getBoundingClientRect();
+  if (!r.width && !r.height) {
+    els.mover.style.display = "none";
+    return;
+  }
+  els.mover.style.display = "flex";
+  // Half-overlap the block's edge: the pointer can travel from text to handle
+  // without ever leaving the block, so the hover state never drops.
+  els.mover.style.left = `${Math.max(4, r.left - 9)}px`;
+  els.mover.style.top = `${Math.max(4, r.top + 1)}px`;
+}
+
+function showDropline(drop) {
+  if (!drop || !drop.ref.isConnected) {
+    els.dropline.style.display = "none";
+    return;
+  }
+  const r = drop.ref.getBoundingClientRect();
+  els.dropline.style.display = "block";
+  els.dropline.style.left = `${r.left}px`;
+  els.dropline.style.width = `${r.width}px`;
+  els.dropline.style.top = `${(drop.before ? r.top : r.bottom) - 1}px`;
+}
 
 function place(box, el, pad = 2) {
   if (!el || !el.isConnected) {
@@ -720,12 +768,16 @@ function boot() {
   }, true);
 
   document.addEventListener("mouseover", (event) => {
-    if (isOurs(event.target) || resizing) return;
+    if (isOurs(event.target) || resizing || moving) return;
     const target = targetFor(event.target);
     hoverTarget = target ? target.el : null;
+    // The move handle works per element, not per labeled container, so each
+    // paragraph inside a card can travel on its own.
+    hoverMove = hoverTarget ? innermostBlock(event.target) || hoverTarget : null;
     hoverMedia = event.target.closest ? event.target.closest("img, video") : null;
     place(els.outline, hoverTarget);
     showChip(hoverTarget);
+    showMover(hoverMove);
     showGrip(hoverMedia);
     const interactive = event.target.closest && event.target.closest("a[href], [data-href], button, [role='button']");
     const draggable = hoverMedia && hoverMedia.tagName === "IMG";
@@ -733,11 +785,13 @@ function boot() {
   });
 
   document.addEventListener("mouseleave", () => {
-    if (resizing) return;
+    if (resizing || moving) return;
     hoverTarget = null;
+    hoverMove = null;
     hoverMedia = null;
     place(els.outline, null);
     showChip(null);
+    showMover(null);
     showGrip(null);
     showHint("");
   });
@@ -924,6 +978,18 @@ function boot() {
       sel.addRange(range);
       document.body.focus({ preventScroll: true });
       document.execCommand("createLink", false, href);
+      // On pages that reset anchor styling the new link looks like plain
+      // prose — underline it so the user sees that it took.
+      const node = sel.anchorNode;
+      const el = node && (node.nodeType === 1 ? node : node.parentElement);
+      const created = el && el.closest ? el.closest("a") : null;
+      if (created) {
+        const patch = linkStyleFixup(
+          getComputedStyle(created),
+          created.parentElement ? getComputedStyle(created.parentElement) : null
+        );
+        if (patch.textDecoration) created.style.textDecoration = patch.textDecoration;
+      }
     }
     scheduleSave();
   }
@@ -1145,6 +1211,128 @@ function boot() {
     }
   });
 
+  // ------------------------------------------------------------- block moves
+
+  // The handle on a block's left edge moves the whole block. Pointer-based,
+  // not HTML5 drag: the element is relocated on drop, never cloned, so
+  // identity (labels, captured originals, comment anchors) survives the move.
+  let moving = null; // { el, label, drop: { ref, before } | null } while the handle is held
+
+  const dropPointFor = (x, y) => {
+    const under = document.elementFromPoint(x, y);
+    if (!under || isOurs(under)) return null;
+    const block = innermostBlock(under);
+    if (!block || block === moving.el || moving.el.contains(block)) return null;
+    const r = block.getBoundingClientRect();
+    return { ref: block, before: y < r.top + r.height / 2 };
+  };
+
+  els.mover.addEventListener("pointerdown", (event) => {
+    const el = hoverMove && hoverMove.isConnected ? hoverMove : hoverTarget;
+    if (!el || !el.isConnected) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = targetFor(el);
+    moving = { el, label: target ? target.label : "Block", drop: null };
+    captureOriginal(moving.el);
+    moving.el.style.opacity = "0.4";
+    place(els.outline, null);
+    showChip(null);
+    try {
+      els.mover.setPointerCapture(event.pointerId);
+    } catch {
+      // Window-level listeners track the move even without capture.
+    }
+  });
+
+  window.addEventListener("pointermove", (event) => {
+    if (!moving) return;
+    event.preventDefault();
+    moving.drop = dropPointFor(event.clientX, event.clientY);
+    showDropline(moving.drop);
+  });
+
+  window.addEventListener("pointerup", () => {
+    if (!moving) return;
+    const { el, label, drop } = moving;
+    moving = null;
+    showDropline(null);
+    showMover(null);
+    el.style.opacity = "";
+    suppressUntil = Date.now() + 250;
+    if (!drop || !drop.ref.isConnected || !el.isConnected) return;
+    // Dropping right back where it came from is a no-op, not an edit.
+    const next = drop.before ? drop.ref : drop.ref.nextElementSibling;
+    if (next === el || (drop.before ? drop.ref.previousElementSibling : drop.ref) === el) return;
+    userEdited = true;
+    drop.ref.parentNode.insertBefore(el, next);
+    const prev = el.previousElementSibling;
+    const following = el.nextElementSibling;
+    queueEdit({
+      label,
+      kind: "moved",
+      before: originalText.get(el),
+      after: el.textContent,
+      before_html: originalHtml.get(el),
+      after_html: blockHtml(el),
+      moved_after: prev ? clip(prev.textContent, 90) : "",
+      moved_before: following ? clip(following.textContent, 90) : "",
+    });
+    flushSave();
+  });
+
+  // ------------------------------------------------------------- image paste
+
+  // Pasted images cross to the chrome page as bytes; the server writes them
+  // into assets/ next to the reviewed file and the confirmed relative path
+  // comes back to be inserted where the caret was.
+  let pasteSeq = 0;
+  const pendingPastes = new Map(); // id → collapsed caret range to insert at
+
+  document.addEventListener(
+    "paste",
+    (event) => {
+      if (isOurs(event.target)) return;
+      const items = event.clipboardData ? [...event.clipboardData.items] : [];
+      const images = items.filter((item) => item.kind === "file" && /^image\//.test(item.type));
+      if (!images.length) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const sel = document.getSelection();
+      const caret = sel && sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
+      for (const item of images) {
+        const file = item.getAsFile();
+        if (!file) continue;
+        pasteSeq += 1;
+        const id = `paste_${pasteSeq}`;
+        pendingPastes.set(id, caret);
+        file.arrayBuffer().then((bytes) => post("eh:asset", { id, assetType: file.type, bytes }));
+      }
+    },
+    true
+  );
+
+  const insertPastedImage = (id, src) => {
+    const caret = pendingPastes.get(id);
+    pendingPastes.delete(id);
+    userEdited = true;
+    const img = document.createElement("img");
+    img.setAttribute("src", src);
+    img.style.maxWidth = "100%";
+    const anchored = caret && caret.startContainer && document.body.contains(caret.startContainer) && !isOurs(caret.startContainer);
+    if (anchored) {
+      const target = targetFor(caret.startContainer);
+      if (target) captureOriginal(target.el);
+      caret.collapse(false);
+      caret.insertNode(img);
+    } else {
+      document.body.appendChild(img);
+    }
+    const landed = targetFor(img);
+    emitBlockEdit(landed ? landed.el : img, landed ? landed.label : "Pasted image");
+    flushSave();
+  };
+
   document.addEventListener("input", (event) => {
     if (isOurs(event.target)) return;
     // A drop fires deleteByDrag/insertFromDrop input events whose selection
@@ -1174,12 +1362,24 @@ function boot() {
   const reposition = () => {
     place(els.outline, hoverTarget);
     showChip(hoverTarget);
+    showMover(moving ? null : hoverMove);
     showGrip(resizing ? resizing.el : hoverMedia);
     // The popup is viewport-fixed; scrolled away from its text it just lies.
     if (linkState) closeLinkbox(false);
   };
-  window.addEventListener("scroll", reposition, true);
-  window.addEventListener("resize", reposition);
+  // getBoundingClientRect on every scroll event forces layout mid-scroll;
+  // one reposition per frame is plenty.
+  let repositionQueued = false;
+  const scheduleReposition = () => {
+    if (repositionQueued) return;
+    repositionQueued = true;
+    requestAnimationFrame(() => {
+      repositionQueued = false;
+      reposition();
+    });
+  };
+  window.addEventListener("scroll", scheduleReposition, true);
+  window.addEventListener("resize", scheduleReposition);
 
   let scrollQueued = false;
   window.addEventListener(
@@ -1245,6 +1445,12 @@ function boot() {
         break;
       case "eh:restoreScroll":
         window.scrollTo(msg.x || 0, msg.y || 0);
+        break;
+      case "eh:assetSaved":
+        insertPastedImage(msg.id, String(msg.src || ""));
+        break;
+      case "eh:assetFailed":
+        pendingPastes.delete(msg.id);
         break;
       default:
         break;

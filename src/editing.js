@@ -34,6 +34,18 @@ export function listStyleFixup(tagName, computed) {
 }
 
 /**
+ * Style a fresh link needs when the page can't distinguish it from prose.
+ * Reset stylesheets (`a { color: inherit; text-decoration: inherit }`) make a
+ * just-created link invisible; underline it only when neither color nor
+ * decoration sets it apart.
+ */
+export function linkStyleFixup(anchorComputed, parentComputed) {
+  const decorated = String(anchorComputed.textDecorationLine || "").includes("underline");
+  const recolored = !!parentComputed && anchorComputed.color !== parentComputed.color;
+  return decorated || recolored ? {} : { textDecoration: "underline" };
+}
+
+/**
  * A typed link, made openable and safe. Bare domains get https://, in-page
  * and relative references pass through, and anything with an executable or
  * unknown scheme (javascript:, data:, …) is rejected outright.

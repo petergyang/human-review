@@ -17,9 +17,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
  * `human-review` into SKILL.md. That binary is gone the moment npx exits, and
  * every later agent invocation dies with "command not found".
  */
-export function invocation() {
+export function invocation(run = spawnSync) {
   const probe = process.platform === "win32" ? "where" : "which";
-  const found = spawnSync(probe, ["human-review"], { encoding: "utf8" });
+  const found = run(probe, ["human-review"], { encoding: "utf8", windowsHide: true });
   const resolved = found.status === 0 ? found.stdout.trim().split(/\r?\n/)[0].trim() : "";
   return resolved && !isNpxCachePath(resolved) ? "human-review" : "npx -y human-review";
 }

@@ -562,10 +562,27 @@ window.addEventListener("message", async (event) => {
           after: msg.after,
           before_html: msg.before_html,
           after_html: msg.after_html,
+          moved_after: msg.moved_after,
+          moved_before: msg.moved_before,
         }),
       })).page;
       state.sent = false;
       render();
+      break;
+    case "eh:asset":
+      try {
+        const saved = await fetch(`/api/page/${state.key}/asset?type=${encodeURIComponent(msg.assetType || "")}`, {
+          method: "POST",
+          headers: { "content-type": "application/octet-stream", "x-human-review-token": state.token },
+          body: msg.bytes,
+        });
+        const data = await saved.json();
+        if (!saved.ok) throw new Error(data.error || "could not save the pasted image");
+        toFrame({ type: "eh:assetSaved", id: msg.id, src: data.src });
+      } catch (err) {
+        toast(err.message);
+        toFrame({ type: "eh:assetFailed", id: msg.id });
+      }
       break;
     case "eh:saving":
       state.save = "saving";

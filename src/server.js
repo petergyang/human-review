@@ -96,6 +96,7 @@ async function fetchLocalPage(target, redirects = 0) {
 
 export function createServer() {
   const store = new Store();
+  const cliInvocation = invocation();
 
   /**
    * Random per-run secret. Every /api route requires it, so a malicious web
@@ -368,6 +369,25 @@ export function createServer() {
     });
   }
 
+  /** Binary request body (pasted images), capped like readBody. */
+  function readRawBody(req) {
+    return new Promise((resolve, reject) => {
+      let size = 0;
+      const chunks = [];
+      req.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > MAX_BODY) {
+          reject(new Error("body too large"));
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("error", reject);
+    });
+  }
+
   const json = (res, code, payload) => {
     res.writeHead(code, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(payload));
@@ -412,7 +432,7 @@ export function createServer() {
       comments: page.comments,
       edits: page.edits,
       canRevert: page.kind !== "url" && typeof page.pristine === "string" && page.pristine.length > 0,
-      pollCommand: `${invocation()} poll ${shellQuote(pollTarget)}`,
+      pollCommand: `${cliInvocation} poll ${shellQuote(pollTarget)}`,
     };
   }
 
@@ -633,10 +653,39 @@ export function createServer() {
         if (action === "edit" && req.method === "POST") {
           const body = await readBody(req);
           const label = String(body.label || "Document");
-          const kind = body.kind === "deleted" ? "deleted" : "edited";
+          const kind = body.kind === "deleted" ? "deleted" : body.kind === "moved" ? "moved" : "edited";
           const cap = (s) => (typeof s === "string" ? s.slice(0, 4000) : undefined);
-          store.addEdit(key, label, kind, cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html));
+          const extra =
+            kind === "moved" ? { moved_after: cap(body.moved_after) || "", moved_before: cap(body.moved_before) || "" } : undefined;
+          store.addEdit(key, label, kind, cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html), extra);
           return json(res, 200, { page: pageState(key) });
+        }
+
+        // A pasted image: write it next to the reviewed file so the relative
+        // src resolves in the review, in the saved file, and for the agent.
+        if (action === "asset" && req.method === "POST") {
+          const page = store.page(key);
+          if (page.kind === "url") {
+            return json(res, 400, { error: "Pasting images works on file reviews — for localhost pages, add the image to the app source." });
+          }
+          const type = String(url.searchParams.get("type") || "");
+          const ext = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" }[type];
+          if (!ext) return json(res, 400, { error: `unsupported image type: ${type || "unknown"}` });
+          const bytes = await readRawBody(req);
+          if (!bytes.length) return json(res, 400, { error: "empty image" });
+          const dir = path.join(path.dirname(page.file), "assets");
+          fs.mkdirSync(dir, { recursive: true });
+          const base = path
+            .basename(page.file)
+            .replace(/\.[^.]+$/, "")
+            .replace(/[^\w-]+/g, "-");
+          let name = "";
+          for (let n = 1; ; n += 1) {
+            name = `${base}-paste-${n}.${ext}`;
+            if (!fs.existsSync(path.join(dir, name))) break;
+          }
+          fs.writeFileSync(path.join(dir, name), bytes);
+          return json(res, 200, { src: `assets/${name}` });
         }
 
         if (action === "save" && req.method === "POST") {
