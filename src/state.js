@@ -203,22 +203,59 @@ export class Store {
   }
 
   /**
-   * Edits are deduped by label+kind so retyping one block stays one row, but
-   * the text is refreshed every time so `after` is always the latest wording.
+   * Edits are deduped by the block's client id (`cid`) when the SDK sends one,
+   * so retyping one block stays one row even when two blocks share a label.
+   * The label+kind fallback keeps continuity across frame reloads, where the
+   * same block boots with a fresh cid — but only for rows written before this
+   * frame booted (`bootAt`), so two live blocks that happen to share a label
+   * never collapse into one row. The text is refreshed every time so `after`
+   * is always the latest wording. Each row gets a durable server id, the
+   * handle for undoing that single row.
    */
-  addEdit(key, label, kind, before, after, beforeHtml, afterHtml, extra) {
+  addEdit(key, label, kind, before, after, beforeHtml, afterHtml, extra, bootAt) {
     return this.update(key, (page) => {
-      const row = page.edits.find((e) => e.label === label && e.kind === kind);
+      const cid = extra && extra.cid;
+      const row =
+        (cid && page.edits.find((e) => e.cid === cid)) ||
+        page.edits.find(
+          (e) =>
+            e.label === label &&
+            e.kind === kind &&
+            (!cid || !e.cid || (e.updatedAt || 0) < (bootAt || Infinity))
+        );
       if (row) {
         if (after !== undefined) row.after = after;
         if (afterHtml !== undefined) row.after_html = afterHtml;
-        // A re-move of the same block replaces its landing spot.
+        // A re-move of the same block replaces its landing spot, and a reload
+        // hands the row to the block's fresh cid.
         if (extra) Object.assign(row, extra);
         row.updatedAt = Date.now();
         return;
       }
-      page.edits.push({ label, kind, before, after, before_html: beforeHtml, after_html: afterHtml, ...(extra || {}), at: Date.now(), updatedAt: Date.now() });
+      page.edits.push({
+        id: `e_${crypto.randomBytes(6).toString("hex")}`,
+        label,
+        kind,
+        before,
+        after,
+        before_html: beforeHtml,
+        after_html: afterHtml,
+        ...(extra || {}),
+        at: Date.now(),
+        updatedAt: Date.now(),
+      });
     });
+  }
+
+  /** Undo of a single row, by its server id. Returns null for an unknown id. */
+  removeEdit(key, id) {
+    let found = false;
+    const page = this.update(key, (p) => {
+      const next = p.edits.filter((e) => e.id !== id);
+      found = next.length !== p.edits.length;
+      p.edits = next;
+    });
+    return found ? page : null;
   }
 
   clearEdits(key) {

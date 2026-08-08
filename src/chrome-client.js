@@ -30,6 +30,8 @@ const state = {
   reloading: false,
   dynamic: false,
   framePolicy: null,
+  /** cids the current frame's SDK can still revert in the DOM. */
+  undoable: new Set(),
 };
 
 /**
@@ -105,6 +107,7 @@ async function loadPage(key, { reload = true } = {}) {
   state.sent = false;
   state.dynamic = false;
   state.baseHash = null;
+  state.undoable = new Set();
   clearTimeout(retryTimer);
   if (reload) {
     state.reloading = true;
@@ -236,6 +239,11 @@ function render() {
     rows.textContent = "";
     const LIMIT = 5;
     const shown = state.editsExpanded ? edits : edits.slice(0, LIMIT);
+    // Undo is offered only where it can actually deliver: while nothing is
+    // sent, and only for rows the live frame can still revert — except on
+    // feedback-only pages, where the row itself is the whole change.
+    const feedbackOnly = page.kind === "url" || page.markdown || state.dynamic;
+    const locked = state.agent === "working" || state.agent === "stranded" || state.sent;
     for (const edit of shown) {
       const row = document.createElement("div");
       row.className = `edit-row${edit.kind === "deleted" ? " deleted" : ""}`;
@@ -248,6 +256,19 @@ function render() {
       kind.className = "kind";
       kind.textContent = edit.kind;
       row.append(pip, label, kind);
+      if (edit.id && !locked && (feedbackOnly || (edit.cid && state.undoable.has(edit.cid)))) {
+        const undo = document.createElement("button");
+        undo.type = "button";
+        undo.className = "edit-undo";
+        undo.title = "Undo this change";
+        undo.setAttribute("aria-label", `Undo the ${edit.kind} change to ${edit.label}`);
+        undo.textContent = "↩";
+        undo.addEventListener("click", (event) => {
+          event.stopPropagation();
+          undoEdit(edit);
+        });
+        row.append(undo);
+      }
       rows.append(row);
     }
     if (edits.length > LIMIT) {
@@ -407,12 +428,77 @@ function editComment(card, body, comment) {
   input.setSelectionRange(input.value.length, input.value.length);
 }
 
-function toast(message) {
+function toast(message, action) {
   const el = document.createElement("div");
   el.className = "toast";
   el.textContent = message;
+  if (action) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "toast-action";
+    btn.textContent = action.label;
+    btn.addEventListener("click", () => {
+      el.remove();
+      action.run();
+    });
+    el.append(btn);
+  }
   document.body.append(el);
-  setTimeout(() => el.remove(), 3200);
+  setTimeout(() => el.remove(), action ? 6000 : 3200);
+}
+
+// --------------------------------------------------------------------- undo
+
+/** In-flight eh:undo transactions, resolved by eh:undone (or a timeout). */
+const undoWaiters = new Map();
+function undoInFrame(cid, domRevert) {
+  return new Promise((resolve) => {
+    undoWaiters.set(cid, resolve);
+    toFrame({ type: "eh:undo", cid, domRevert });
+    setTimeout(() => {
+      if (undoWaiters.get(cid) === resolve) {
+        undoWaiters.delete(cid);
+        resolve({ ok: false });
+      }
+    }, 800);
+  });
+}
+
+/** A pending batch freezes what the agent will apply; undo must wait for it. */
+const feedbackLocked = () => state.agent === "working" || state.agent === "stranded" || state.sent;
+
+/**
+ * Undo one edit row. The SDK owns the transaction (purge queue → revert DOM →
+ * save); the row is dropped server-side only after the frame confirms, so a
+ * debounced flush can never resurrect it.
+ */
+async function undoEdit(edit) {
+  if (feedbackLocked()) {
+    toast("Feedback already sent — wait for the agent before undoing");
+    return;
+  }
+  const page = state.page;
+  // File-backed HTML must revert on disk; rendered sources (markdown,
+  // localhost, self-rendering pages) never wrote a file, so removing the row
+  // is the whole undo there.
+  const fileBacked = page.kind !== "url" && !page.markdown && !state.dynamic;
+  const domRevert = page.kind === "url" ? false : page.markdown ? true : !state.dynamic;
+  const result = edit.cid ? await undoInFrame(edit.cid, domRevert) : { ok: false };
+  if (!result.ok && fileBacked) {
+    toast("Can't undo this one — the page reloaded since the change was made");
+    render();
+    return;
+  }
+  try {
+    state.page = (await api(`/api/page/${state.key}/edit/${edit.id}`, { method: "DELETE" })).page;
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+  if (!fileBacked && !result.ok) toast("Removed from feedback");
+  render();
+  // A restore rebuilt the block's inner markup; re-anchor any comment marks it held.
+  if (result.ok && domRevert) toFrame({ type: "eh:anchors", comments: state.page.comments || [] });
 }
 
 function setActive(id, scroll) {
@@ -556,6 +642,8 @@ window.addEventListener("message", async (event) => {
       state.page = (await api(`/api/page/${state.key}/edit`, {
         method: "POST",
         body: JSON.stringify({
+          cid: msg.cid,
+          boot: msg.boot,
           label: msg.label,
           kind: msg.kind,
           before: msg.before,
@@ -568,7 +656,25 @@ window.addEventListener("message", async (event) => {
       })).page;
       state.sent = false;
       render();
+      // Deleting a block is the easiest change to make by accident; offer the
+      // way back the moment it happens.
+      if (msg.kind === "deleted" && msg.cid) {
+        const row = (state.page.edits || []).find((e) => e.cid === msg.cid);
+        if (row) toast(`Deleted ${row.label}`, { label: "Undo", run: () => undoEdit(row) });
+      }
       break;
+    case "eh:undoable":
+      state.undoable = new Set(msg.cids || []);
+      render();
+      break;
+    case "eh:undone": {
+      const waiter = undoWaiters.get(msg.cid);
+      if (waiter) {
+        undoWaiters.delete(msg.cid);
+        waiter({ ok: !!msg.ok });
+      }
+      break;
+    }
     case "eh:asset":
       try {
         const saved = await fetch(`/api/page/${state.key}/asset?type=${encodeURIComponent(msg.assetType || "")}`, {
@@ -791,6 +897,8 @@ function connect() {
     const hadEdits = state.page ? state.page.edits.length : 0;
     state.reloading = true;
     state.dynamic = false;
+    // The frame is about to reboot: its undo registry dies with it.
+    state.undoable = new Set();
     // The file on disk changed: queued saves are based on the old version.
     state.baseHash = null;
     clearTimeout(retryTimer);

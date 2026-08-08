@@ -655,9 +655,30 @@ export function createServer() {
           const label = String(body.label || "Document");
           const kind = body.kind === "deleted" ? "deleted" : body.kind === "moved" ? "moved" : "edited";
           const cap = (s) => (typeof s === "string" ? s.slice(0, 4000) : undefined);
-          const extra =
-            kind === "moved" ? { moved_after: cap(body.moved_after) || "", moved_before: cap(body.moved_before) || "" } : undefined;
-          store.addEdit(key, label, kind, cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html), extra);
+          const extra = {
+            ...(kind === "moved" ? { moved_after: cap(body.moved_after) || "", moved_before: cap(body.moved_before) || "" } : {}),
+            // The SDK's per-block id, so one block stays one row and the
+            // browser can undo exactly the row it reverted.
+            ...(typeof body.cid === "string" && body.cid ? { cid: body.cid.slice(0, 80) } : {}),
+          };
+          store.addEdit(
+            key,
+            label,
+            kind,
+            cap(body.before),
+            cap(body.after),
+            cap(body.before_html),
+            cap(body.after_html),
+            extra,
+            Number(body.boot) || 0
+          );
+          return json(res, 200, { page: pageState(key) });
+        }
+
+        // Undo of one edit row: the SDK has already reverted the block (or the
+        // page is feedback-only and the row is the only artifact).
+        if (action === "edit" && req.method === "DELETE" && tail) {
+          if (!store.removeEdit(key, tail)) return json(res, 404, { error: "unknown edit" });
           return json(res, 200, { page: pageState(key) });
         }
 
