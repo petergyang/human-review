@@ -119,3 +119,57 @@ test("poll exits with the feedback batch when the user sends", async (t) => {
   assert.equal(batch.status, "feedback");
   assert.equal(batch.pages[0].comments[0].feedback, "Make this clearer.");
 });
+
+test("a poll started after the user ends the review exits at once instead of waiting", async (t) => {
+  // Its own state dir: the test above removes tmp in its teardown.
+  const own = fs.mkdtempSync(path.join(os.tmpdir(), "human-review-ended-"));
+  process.env.HUMAN_REVIEW_STATE_DIR = path.join(own, "state");
+  const file = path.join(own, "review.html");
+  fs.writeFileSync(file, "<p>Original</p>");
+
+  const reviewServer = spawn(process.execPath, ["src/server-entry.js"], {
+    cwd: project,
+    env: { ...process.env, HUMAN_REVIEW_STATE_DIR: process.env.HUMAN_REVIEW_STATE_DIR },
+    stdio: "ignore",
+  });
+
+  t.after(async () => {
+    if (reviewServer.exitCode === null) {
+      reviewServer.kill();
+      await once(reviewServer, "exit");
+    }
+    fs.rmSync(own, { recursive: true, force: true });
+  });
+
+  const server = await waitForServer();
+  const opened = await request(server, "POST", "/api/session", { file });
+  assert.equal(opened.status, 200);
+
+  // End the review with no poll in flight. This is the ordinary case: the agent
+  // applies a delivered batch, and only then polls again.
+  const ended = await request(server, "POST", `/api/session/${opened.body.sessionId}/end`);
+  assert.equal(ended.status, 200);
+
+  const started = Date.now();
+  const child = spawn(process.execPath, ["src/cli.js", "poll", file, "--timeout", "20"], {
+    cwd: project,
+    env: { ...process.env, HUMAN_REVIEW_STATE_DIR: process.env.HUMAN_REVIEW_STATE_DIR },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const result = await collect(child);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, "closed");
+  // Without the end mark this poll burns the full 20s and reports a timeout.
+  assert.ok(Date.now() - started < 10000, `poll took ${Date.now() - started}ms`);
+
+  // The mark is consumed, and reopening the target is a live review again, so a
+  // second poll must wait for real feedback rather than reporting closed twice.
+  const reopened = await request(server, "POST", "/api/session", { file });
+  assert.equal(reopened.status, 200);
+  const again = spawn(process.execPath, ["src/cli.js", "poll", file, "--timeout", "2"], {
+    cwd: project,
+    env: { ...process.env, HUMAN_REVIEW_STATE_DIR: process.env.HUMAN_REVIEW_STATE_DIR },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(JSON.parse((await collect(again)).stdout).status, "timeout");
+});
