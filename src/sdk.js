@@ -541,17 +541,56 @@ function flushSave() {
 const editQueue = new Map();
 let editTimer = null;
 
+/** When this document booted — lets the server tell a reloaded frame's fresh
+ * cids apart from two live blocks that happen to share a label. */
+const BOOT_AT = Date.now();
+
 function flushEdits() {
   clearTimeout(editTimer);
   editTimer = null;
-  for (const payload of editQueue.values()) post("eh:edit", payload);
+  for (const payload of editQueue.values()) post("eh:edit", { boot: BOOT_AT, ...payload });
   editQueue.clear();
 }
 
 function queueEdit(payload) {
-  editQueue.set(`${payload.label}\u0000${payload.kind}`, payload);
+  editQueue.set(payload.cid || `${payload.label}\u0000${payload.kind}`, payload);
   clearTimeout(editTimer);
   editTimer = setTimeout(flushEdits, EDIT_FLUSH_MS);
+}
+
+// --------------------------------------------------------------- undo registry
+
+/**
+ * What it takes to undo one edit row, keyed by the row's cid. Lives only as
+ * long as this document: element references cannot survive a reload, so after
+ * one the chrome simply stops offering undo for these rows. Entries hold the
+ * exact nodes involved — a removed element is kept detached and reinserted as
+ * itself, so labels, captured originals, and comment anchors keep their
+ * identity.
+ */
+const undoRegistry = new Map(); // cid -> { kind, el, parent?, prev?, next? }
+const blockIds = new WeakMap();
+let cidSeq = 0;
+
+/** A stable per-document id for a block; one row per block per kind. */
+function cidFor(el, kind) {
+  if (!blockIds.has(el)) {
+    cidSeq += 1;
+    blockIds.set(el, `b${cidSeq}_${Math.random().toString(36).slice(2, 8)}`);
+  }
+  return `${blockIds.get(el)}:${kind}`;
+}
+
+function postUndoable() {
+  post("eh:undoable", { cids: [...undoRegistry.keys()] });
+}
+
+function registerUndo(cid, entry) {
+  // A move's home is where the block sat before its FIRST move; a re-move
+  // must not overwrite it with an intermediate spot.
+  if (entry.kind === "moved" && undoRegistry.has(cid)) return;
+  undoRegistry.set(cid, entry);
+  postUndoable();
 }
 
 // ------------------------------------------------------------- interactions
@@ -806,6 +845,7 @@ function boot() {
     userEdited = true;
     const target = targetFor(hoverMedia);
     const blockEl = target ? target.el : hoverMedia;
+    captureOriginal(blockEl);
     resizing = {
       el: hoverMedia,
       startX: event.clientX,
@@ -833,7 +873,10 @@ function boot() {
     const { blockEl, label, beforeText, beforeHtml } = resizing;
     resizing = null;
     suppressUntil = Date.now() + 250;
+    const cid = cidFor(blockEl, "edited");
+    registerUndo(cid, { kind: "edited", el: blockEl });
     queueEdit({
+      cid,
       label,
       kind: "edited",
       before: beforeText,
@@ -852,11 +895,22 @@ function boot() {
     const target = targetFor(hoverTarget);
     const label = target ? target.label : "Element";
     const before = hoverTarget.textContent;
+    const cid = cidFor(hoverTarget, "deleted");
+    // Keep the removed node itself plus both neighbors: reinsertion as the
+    // same element preserves every identity (label, originals, comment marks),
+    // and either neighbor can die before the undo without stranding it.
+    registerUndo(cid, {
+      kind: "deleted",
+      el: hoverTarget,
+      parent: hoverTarget.parentNode,
+      prev: hoverTarget.previousSibling,
+      next: hoverTarget.nextSibling,
+    });
     hoverTarget.remove();
     hoverTarget = null;
     place(els.outline, null);
     showChip(null);
-    queueEdit({ label, kind: "deleted", before, after: "" });
+    queueEdit({ cid, label, kind: "deleted", before, after: "" });
     flushSave();
   });
 
@@ -875,7 +929,10 @@ function boot() {
   const emitBlockEdit = (blockEl, fallbackLabel) => {
     const connected = blockEl.isConnected;
     const target = connected ? targetFor(blockEl) : null;
+    const cid = cidFor(blockEl, "edited");
+    if (connected) registerUndo(cid, { kind: "edited", el: blockEl });
     queueEdit({
+      cid,
       label: (target && target.label) || fallbackLabel || "Document body",
       kind: "edited",
       before: originalText.get(blockEl),
@@ -1265,10 +1322,13 @@ function boot() {
     const next = drop.before ? drop.ref : drop.ref.nextElementSibling;
     if (next === el || (drop.before ? drop.ref.previousElementSibling : drop.ref) === el) return;
     userEdited = true;
+    const cid = cidFor(el, "moved");
+    registerUndo(cid, { kind: "moved", el, parent: el.parentNode, prev: el.previousSibling, next: el.nextSibling });
     drop.ref.parentNode.insertBefore(el, next);
     const prev = el.previousElementSibling;
     const following = el.nextElementSibling;
     queueEdit({
+      cid,
       label,
       kind: "moved",
       before: originalText.get(el),
@@ -1346,9 +1406,12 @@ function boot() {
     const sel = document.getSelection();
     const node = sel && sel.anchorNode ? sel.anchorNode : event.target;
     const target = targetFor(node);
+    const cid = target ? cidFor(target.el, "edited") : undefined;
+    if (target && originalHtml.has(target.el)) registerUndo(cid, { kind: "edited", el: target.el });
     // Text alone loses formatting-only edits (bold, italic, underline change
     // markup, not textContent), so the block's cleaned HTML travels too.
     queueEdit({
+      cid,
       label: target ? target.label : "Document body",
       kind: "edited",
       before: target ? originalText.get(target.el) : undefined,
@@ -1395,6 +1458,56 @@ function boot() {
     { passive: true }
   );
 
+  // ------------------------------------------------------------------- undo
+
+  /**
+   * Put a block back to its captured original by syncing attributes and inner
+   * markup onto the SAME element. Replacing the node would orphan everything
+   * keyed on it (pinned label, captured originals, comment markers).
+   */
+  const restoreOriginal = (el) => {
+    const html = originalHtml.get(el);
+    if (typeof html !== "string") return false;
+    const tpl = document.createElement("template");
+    tpl.innerHTML = html;
+    const src = tpl.content.firstElementChild;
+    if (!src || src.tagName !== el.tagName) return false;
+    // blockHtml strips the element-comment marker from snapshots; keep the
+    // live one so "Jump to" still lands.
+    const commentMark = el.getAttribute("data-eh-el");
+    for (const name of [...el.getAttributeNames()]) {
+      if (!src.hasAttribute(name)) el.removeAttribute(name);
+    }
+    for (const name of src.getAttributeNames()) el.setAttribute(name, src.getAttribute(name));
+    if (commentMark) el.setAttribute("data-eh-el", commentMark);
+    if (!/^(img|br|hr|input|source|track|wbr|embed|area|col|base|link|meta|param)$/i.test(el.tagName)) {
+      el.innerHTML = src.innerHTML;
+    }
+    return true;
+  };
+
+  /** Reinsert at the remembered spot, tolerating one dead neighbor. */
+  const reinsertAt = (el, parent, prev, next) => {
+    if (!parent || !parent.isConnected) return false;
+    if (next && next.parentNode === parent) parent.insertBefore(el, next);
+    else if (prev && prev.parentNode === parent) prev.after(el);
+    else parent.appendChild(el);
+    return true;
+  };
+
+  const revertEntry = (entry) => {
+    if (entry.kind === "edited") return entry.el.isConnected ? restoreOriginal(entry.el) : false;
+    if (entry.kind === "deleted") {
+      if (entry.el.isConnected) return true;
+      return reinsertAt(entry.el, entry.parent, entry.prev, entry.next);
+    }
+    if (entry.kind === "moved") {
+      if (!entry.el.isConnected) return false;
+      return reinsertAt(entry.el, entry.parent, entry.prev, entry.next);
+    }
+    return false;
+  };
+
   window.addEventListener("message", (event) => {
     // Only the chrome page may drive the SDK — not popups the artifact opened,
     // and not the artifact's own scripts.
@@ -1434,7 +1547,32 @@ function boot() {
         clearTimeout(saveTimer);
         clearTimeout(editTimer);
         editQueue.clear();
+        undoRegistry.clear();
+        postUndoable();
         break;
+      case "eh:undo": {
+        // Undo one edit row. Strict order: purge the queued payload first (a
+        // later flush would resurrect the row), revert the DOM, then save —
+        // only after eh:undone does the chrome drop the row server-side.
+        const entry = undoRegistry.get(msg.cid);
+        if (!entry) {
+          post("eh:undone", { cid: msg.cid, ok: false });
+          break;
+        }
+        editQueue.delete(msg.cid);
+        undoRegistry.delete(msg.cid);
+        postUndoable();
+        let ok = true;
+        if (msg.domRevert !== false) {
+          ok = revertEntry(entry);
+          if (ok) {
+            userEdited = true;
+            flushSave();
+          }
+        }
+        post("eh:undone", { cid: msg.cid, ok });
+        break;
+      }
       case "eh:raw":
         checkDynamic(String(msg.html || ""));
         break;

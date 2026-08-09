@@ -350,6 +350,20 @@ body.collapsed .handle { right: 0; }
 .edit-row.deleted .pip { background: var(--danger); }
 .edit-row .label { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .edit-row .kind { margin-left: auto; color: var(--faint-2); font-size: 11px; white-space: nowrap; }
+.edit-undo {
+  flex: none;
+  width: 21px;
+  height: 21px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--faint-2);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.edit-undo:hover { background: var(--soft); color: var(--strong-txt); }
 
 .edit-more {
   width: 100%;
@@ -444,6 +458,17 @@ body.collapsed .handle { right: 0; }
   font-size: 12px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   animation: rise 140ms ease-out;
+}
+.toast-action {
+  margin-left: 12px;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
 }
 
 @keyframes rise {
