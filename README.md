@@ -57,7 +57,7 @@ Note: For HTML files, direct edits and resizes save automatically. For Markdown 
 - **Add links** — select text and press ⌘K. ⌘K inside an existing link edits or removes it.
 - **Resize images** by dragging their corner, and **move images** by dragging them to a new spot.
 - **Rearrange the page** — hover any block and drag the handle on its left edge to move the whole block somewhere else.
-- **Paste images** from your clipboard — they're saved into an `assets/` folder next to the file and inserted at your cursor.
+- **Paste images** from your clipboard — file reviews save them beside the document; localhost reviews stage them for the agent to place in the app source.
 - **Select a phrase and leave a comment** anchored to the exact text.
 - **Comment on an image, chart, or section** by clicking the element.
 - **Remove elements** without explaining the deletion in chat.

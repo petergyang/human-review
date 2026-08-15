@@ -564,6 +564,7 @@ window.addEventListener("message", async (event) => {
           after_html: msg.after_html,
           moved_after: msg.moved_after,
           moved_before: msg.moved_before,
+          staged_assets: msg.staged_assets,
         }),
       })).page;
       state.sent = false;
@@ -578,7 +579,7 @@ window.addEventListener("message", async (event) => {
         });
         const data = await saved.json();
         if (!saved.ok) throw new Error(data.error || "could not save the pasted image");
-        toFrame({ type: "eh:assetSaved", id: msg.id, src: data.src });
+        toFrame({ type: "eh:assetSaved", id: msg.id, src: data.src, stagedId: data.stagedId });
       } catch (err) {
         toast(err.message);
         toFrame({ type: "eh:assetFailed", id: msg.id });

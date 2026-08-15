@@ -108,6 +108,10 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   an image: the file already exists in an `assets/` folder next to the reviewed
   file. Keep that relative path — in Markdown, reference it as
   `![](assets/...)`. Never regenerate or inline the image.
+- On a localhost page, a pasted image arrives under `staged_assets`. Copy its
+  local `path` into the app's appropriate asset folder, replace the temporary
+  preview URL in `after_html`, and preserve the image at the user's insertion
+  point. Never leave the temporary preview URL in source.
 - An edit with `kind: "moved"` means the user relocated that whole block.
   Reposition it in the source without rewriting its content: it now sits right
   after the block whose text starts with `moved_after`, and right before the

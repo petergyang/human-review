@@ -213,7 +213,13 @@ export class Store {
         if (after !== undefined) row.after = after;
         if (afterHtml !== undefined) row.after_html = afterHtml;
         // A re-move of the same block replaces its landing spot.
-        if (extra) Object.assign(row, extra);
+        if (extra) {
+          if (extra.staged_assets) {
+            const assets = [...(row.staged_assets || []), ...extra.staged_assets];
+            extra = { ...extra, staged_assets: [...new Map(assets.map((asset) => [asset.path, asset])).values()] };
+          }
+          Object.assign(row, extra);
+        }
         row.updatedAt = Date.now();
         return;
       }

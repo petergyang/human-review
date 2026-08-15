@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { atomicWrite, Store, resolveAsset } from "./state.js";
 import { injectSdk, stripSdk } from "./html-transform.js";
 import { isMarkdown, renderMarkdownPage } from "./markdown.js";
-import { canonicalTarget, ensureStateDir, localUrl, SERVER_PROTOCOL, serverPath, targetKey } from "./paths.js";
+import { canonicalTarget, ensureStateDir, localUrl, SERVER_PROTOCOL, serverPath, stateDir, targetKey } from "./paths.js";
 import { invocation, shellQuote } from "./setup.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -230,6 +230,7 @@ export function createServer() {
           after: e.after,
           ...(e.before_html !== undefined && e.before_html !== e.before ? { before_html: e.before_html } : {}),
           ...(e.after_html !== undefined && e.after_html !== e.after ? { after_html: e.after_html } : {}),
+          ...(Array.isArray(e.staged_assets) && e.staged_assets.length ? { staged_assets: e.staged_assets } : {}),
         })),
       });
     }
@@ -272,7 +273,9 @@ export function createServer() {
           : "") +
         (hasUrl
           ? "Localhost pages were edited directly in the review UI. Find the matching project source (such as MDX or TSX) " +
-            "and apply every exact edit or deletion there; never try to write the rendered HTML response back to the app. "
+            "and apply every exact edit or deletion there; never try to write the rendered HTML response back to the app. " +
+            "When an edit includes `staged_assets`, copy each local image into the app's appropriate asset folder, replace its " +
+            "temporary preview URL in `after_html`, and preserve the image at the user's insertion point. "
           : "") +
         "When every page is updated, run the same poll command again with --ack to clear this " +
         "batch and wait for more.",
@@ -281,7 +284,12 @@ export function createServer() {
     const record = {
       batch,
       delivered: false,
-      cleanup: pages.map((p) => ({ key: p.key, ids: p.comments.map((c) => c.id), sentAt: Date.now() })),
+      cleanup: pages.map((p) => ({
+        key: p.key,
+        ids: p.comments.map((c) => c.id),
+        staged: p.edits.flatMap((edit) => (edit.staged_assets || []).map((asset) => asset.path)),
+        sentAt: Date.now(),
+      })),
     };
     batches.set(session.entryKey, record);
     store.setBatch(session.entryKey, record);
@@ -298,6 +306,16 @@ export function createServer() {
     if (!pending || !pending.delivered) return false;
     batches.delete(entryKey);
     store.clearBatch(entryKey);
+    const stagedRoot = path.join(stateDir(), "pasted");
+    for (const file of pending.cleanup.flatMap((entry) => entry.staged || [])) {
+      const resolved = path.resolve(file);
+      const relative = path.relative(stagedRoot, resolved);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
+      try {
+        fs.unlinkSync(resolved);
+        fs.rmdirSync(path.dirname(resolved));
+      } catch {}
+    }
     for (const { key, ids, sentAt } of pending.cleanup) store.clearSent(key, ids, sentAt);
     for (const session of sessionsForEntry(entryKey)) emit(session, "refresh", {});
     // File targets reload through fs.watch. URL targets have no source file to
@@ -550,6 +568,15 @@ export function createServer() {
           return res.end(injectSdk(html, key, sdkOptions));
         }
         if (page.kind === "url") {
+          const stagedPrefix = "__human_review_paste__/";
+          if (asset.startsWith(stagedPrefix)) {
+            const name = asset.slice(stagedPrefix.length);
+            if (!name || path.basename(name) !== name) {
+              res.writeHead(403, { "content-type": "text/plain" });
+              return res.end("Forbidden");
+            }
+            return serveFile(res, path.join(stateDir(), "pasted", key, name));
+          }
           res.writeHead(404, { "content-type": "text/plain" });
           return res.end("Localhost assets load from the reviewed development server.");
         }
@@ -655,37 +682,61 @@ export function createServer() {
           const label = String(body.label || "Document");
           const kind = body.kind === "deleted" ? "deleted" : body.kind === "moved" ? "moved" : "edited";
           const cap = (s) => (typeof s === "string" ? s.slice(0, 4000) : undefined);
-          const extra =
-            kind === "moved" ? { moved_after: cap(body.moved_after) || "", moved_before: cap(body.moved_before) || "" } : undefined;
+          const stagedRoot = path.join(stateDir(), "pasted", key);
+          const stagedAssets = Array.isArray(body.staged_assets)
+            ? body.staged_assets
+                .slice(0, 20)
+                .map((asset) => {
+                  const id = String(asset?.id || "");
+                  return {
+                    id,
+                    path: path.join(stagedRoot, id),
+                    preview_src: String(asset?.preview_src || ""),
+                  };
+                })
+                .filter((asset) => {
+                  const relative = path.relative(stagedRoot, path.resolve(asset.path));
+                  return asset.id && path.basename(asset.id) === asset.id && !relative.startsWith("..") && !path.isAbsolute(relative) && fs.existsSync(asset.path);
+                })
+                .map(({ path: assetPath, preview_src }) => ({ path: assetPath, preview_src }))
+            : [];
+          const extra = {
+            ...(kind === "moved" ? { moved_after: cap(body.moved_after) || "", moved_before: cap(body.moved_before) || "" } : {}),
+            ...(stagedAssets.length ? { staged_assets: stagedAssets } : {}),
+          };
           store.addEdit(key, label, kind, cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html), extra);
           return json(res, 200, { page: pageState(key) });
         }
 
-        // A pasted image: write it next to the reviewed file so the relative
-        // src resolves in the review, in the saved file, and for the agent.
+        // File reviews keep pasted images beside the document. Localhost
+        // reviews stage them privately until the agent moves them into source.
         if (action === "asset" && req.method === "POST") {
           const page = store.page(key);
-          if (page.kind === "url") {
-            return json(res, 400, { error: "Pasting images works on file reviews — for localhost pages, add the image to the app source." });
-          }
           const type = String(url.searchParams.get("type") || "");
           const ext = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" }[type];
           if (!ext) return json(res, 400, { error: `unsupported image type: ${type || "unknown"}` });
           const bytes = await readRawBody(req);
           if (!bytes.length) return json(res, 400, { error: "empty image" });
-          const dir = path.join(path.dirname(page.file), "assets");
+          const staged = page.kind === "url";
+          const dir = staged ? path.join(stateDir(), "pasted", key) : path.join(path.dirname(page.file), "assets");
           fs.mkdirSync(dir, { recursive: true });
-          const base = path
-            .basename(page.file)
-            .replace(/\.[^.]+$/, "")
-            .replace(/[^\w-]+/g, "-");
+          const base = staged
+            ? "localhost"
+            : path
+                .basename(page.file)
+                .replace(/\.[^.]+$/, "")
+                .replace(/[^\w-]+/g, "-");
           let name = "";
           for (let n = 1; ; n += 1) {
             name = `${base}-paste-${n}.${ext}`;
             if (!fs.existsSync(path.join(dir, name))) break;
           }
-          fs.writeFileSync(path.join(dir, name), bytes);
-          return json(res, 200, { src: `assets/${name}` });
+          const saved = path.join(dir, name);
+          fs.writeFileSync(saved, bytes);
+          return json(res, 200, {
+            src: staged ? `/artifact/${key}/__human_review_paste__/${name}` : `assets/${name}`,
+            ...(staged ? { stagedId: name } : {}),
+          });
         }
 
         if (action === "save" && req.method === "POST") {

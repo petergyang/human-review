@@ -57,6 +57,8 @@ shadow.innerHTML = `
     .chip:hover { background: #1b1a16; color: #fff; border-color: #1b1a16; }
     .chip.danger { color: #b23b2e; }
     .chip.danger:hover { background: #b23b2e; color: #fff; border-color: #b23b2e; }
+    .chips .chip, .mover { opacity: .6; transition: opacity 100ms ease; }
+    .chips .chip:hover, .chips .chip:focus-visible, .mover:hover, .mover:focus-visible { opacity: 1; }
     .grip {
       position: fixed; z-index: 2147483647; width: 13px; height: 13px;
       display: none; border: 1px solid #1b1a16; border-radius: 3px;
@@ -549,7 +551,13 @@ function flushEdits() {
 }
 
 function queueEdit(payload) {
-  editQueue.set(`${payload.label}\u0000${payload.kind}`, payload);
+  const key = `${payload.label}\u0000${payload.kind}`;
+  const queued = editQueue.get(key);
+  if (queued && (queued.staged_assets || payload.staged_assets)) {
+    const assets = [...(queued.staged_assets || []), ...(payload.staged_assets || [])];
+    payload.staged_assets = [...new Map(assets.map((asset) => [asset.path || asset.id, asset])).values()];
+  }
+  editQueue.set(key, payload);
   clearTimeout(editTimer);
   editTimer = setTimeout(flushEdits, EDIT_FLUSH_MS);
 }
@@ -776,8 +784,11 @@ function boot() {
     hoverMove = hoverTarget ? innermostBlock(event.target) || hoverTarget : null;
     hoverMedia = event.target.closest ? event.target.closest("img, video") : null;
     place(els.outline, hoverTarget);
-    showChip(hoverTarget);
-    showMover(hoverMove);
+    if (controlsAreSuppressed()) hideActionControls();
+    else {
+      showChip(hoverTarget);
+      showMover(hoverMove);
+    }
     showGrip(hoverMedia);
     const interactive = event.target.closest && event.target.closest("a[href], [data-href], button, [role='button']");
     const draggable = hoverMedia && hoverMedia.tagName === "IMG";
@@ -872,7 +883,7 @@ function boot() {
 
   /** An edit row for a block changed outside the input-event flow (attribute
    * set, link removal, drag move) — the same shape the input listener emits. */
-  const emitBlockEdit = (blockEl, fallbackLabel) => {
+  const emitBlockEdit = (blockEl, fallbackLabel, extra = {}) => {
     const connected = blockEl.isConnected;
     const target = connected ? targetFor(blockEl) : null;
     queueEdit({
@@ -882,12 +893,42 @@ function boot() {
       after: connected ? blockEl.textContent : "",
       before_html: originalHtml.get(blockEl),
       after_html: connected ? blockHtml(blockEl) : "",
+      ...extra,
     });
+  };
+
+  let typingUntil = 0;
+  let controlRestoreTimer = null;
+
+  const selectionIsActive = () => {
+    const sel = document.getSelection();
+    return !!(sel && !sel.isCollapsed && sel.rangeCount && document.body.contains(sel.getRangeAt(0).commonAncestorContainer));
+  };
+
+  const controlsAreSuppressed = () => Date.now() < typingUntil || selectionIsActive();
+
+  const hideActionControls = () => {
+    showChip(null);
+    showMover(null);
+  };
+
+  const restoreActionControls = () => {
+    if (controlsAreSuppressed()) return;
+    showChip(hoverTarget);
+    showMover(hoverMove);
+  };
+
+  const suppressActionControlsWhileTyping = () => {
+    typingUntil = Date.now() + 800;
+    hideActionControls();
+    clearTimeout(controlRestoreTimer);
+    controlRestoreTimer = setTimeout(restoreActionControls, 810);
   };
   document.addEventListener(
     "beforeinput",
     (event) => {
       if (isOurs(event.target)) return;
+      suppressActionControlsWhileTyping();
       // From here on, DOM drift is the human typing, not the page rendering.
       userEdited = true;
       const sel = document.getSelection();
@@ -896,6 +937,11 @@ function boot() {
     },
     true
   );
+
+  document.addEventListener("selectionchange", () => {
+    if (selectionIsActive()) hideActionControls();
+    else restoreActionControls();
+  });
 
   // ------------------------------------------------------------------ links
 
@@ -1312,7 +1358,7 @@ function boot() {
     true
   );
 
-  const insertPastedImage = (id, src) => {
+  const insertPastedImage = (id, src, stagedId) => {
     const caret = pendingPastes.get(id);
     pendingPastes.delete(id);
     userEdited = true;
@@ -1329,7 +1375,9 @@ function boot() {
       document.body.appendChild(img);
     }
     const landed = targetFor(img);
-    emitBlockEdit(landed ? landed.el : img, landed ? landed.label : "Pasted image");
+    emitBlockEdit(landed ? landed.el : img, landed ? landed.label : "Pasted image", {
+      ...(stagedId ? { staged_assets: [{ id: stagedId, preview_src: src }] } : {}),
+    });
     flushSave();
   };
 
@@ -1447,7 +1495,7 @@ function boot() {
         window.scrollTo(msg.x || 0, msg.y || 0);
         break;
       case "eh:assetSaved":
-        insertPastedImage(msg.id, String(msg.src || ""));
+        insertPastedImage(msg.id, String(msg.src || ""), String(msg.stagedId || ""));
         break;
       case "eh:assetFailed":
         pendingPastes.delete(msg.id);

@@ -111,3 +111,81 @@ test("pasted images land in assets/ next to the reviewed file", async (t) => {
     assert.equal(row.moved_before, "Closing paragraph");
   });
 });
+
+test("localhost image pastes are staged, previewed, and delivered to the agent", async (t) => {
+  const app = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end('<!doctype html><html><body><p data-block="Intro">Hello</p></body></html>');
+  });
+  await new Promise((resolve, reject) => {
+    app.once("error", reject);
+    app.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => app.close());
+
+  const review = await start();
+  t.after(() => review.dispose());
+  const target = `http://localhost:${app.address().port}/wiki`;
+  const opened = JSON.parse(
+    (
+      await request(review.port, {
+        method: "POST",
+        route: "/api/session",
+        headers: { "x-human-review-token": review.token, "content-type": "application/json" },
+        body: JSON.stringify({ target }),
+      })
+    ).raw
+  );
+
+  const pasted = await request(review.port, {
+    method: "POST",
+    route: `/api/page/${opened.key}/asset?type=${encodeURIComponent("image/png")}`,
+    headers: { "x-human-review-token": review.token, "content-type": "application/octet-stream" },
+    body: PNG,
+  });
+  assert.equal(pasted.status, 200, pasted.raw);
+  const asset = JSON.parse(pasted.raw);
+  assert.equal(asset.src, `/artifact/${opened.key}/__human_review_paste__/localhost-paste-1.png`);
+  assert.equal(asset.stagedId, "localhost-paste-1.png");
+  const stagedPath = path.join(process.env.HUMAN_REVIEW_STATE_DIR, "pasted", opened.key, asset.stagedId);
+  assert.deepEqual(fs.readFileSync(stagedPath), PNG);
+
+  const preview = await request(review.port, { route: asset.src });
+  assert.equal(preview.status, 200);
+
+  const afterHtml = `<p data-block="Intro">Hello<img src="${asset.src}"></p>`;
+  await request(review.port, {
+    method: "POST",
+    route: `/api/page/${opened.key}/edit`,
+    headers: { "x-human-review-token": review.token, "content-type": "application/json" },
+    body: JSON.stringify({
+      label: "Intro",
+      kind: "edited",
+      before: "Hello",
+      after: "Hello",
+      after_html: afterHtml,
+      staged_assets: [{ id: asset.stagedId, preview_src: asset.src }],
+    }),
+  });
+  await request(review.port, {
+    method: "POST",
+    route: `/api/page/${opened.key}/send`,
+    headers: { "x-human-review-token": review.token, "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: opened.sessionId, note: "" }),
+  });
+
+  const polled = await request(review.port, {
+    route: `/api/poll?target=${encodeURIComponent(target)}`,
+    headers: { "x-human-review-token": review.token },
+  });
+  const edit = JSON.parse(polled.raw).pages[0].edits[0];
+  assert.equal(edit.after_html, afterHtml);
+  assert.deepEqual(edit.staged_assets, [{ path: stagedPath, preview_src: asset.src }]);
+
+  const acknowledged = await fetch(
+    `http://127.0.0.1:${review.port}/api/poll?target=${encodeURIComponent(target)}&ack=1`,
+    { headers: { "x-human-review-token": review.token } }
+  );
+  await acknowledged.body.cancel();
+  assert.equal(fs.existsSync(stagedPath), false, "the staged copy is removed after the agent acknowledges the batch");
+});
