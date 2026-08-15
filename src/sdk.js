@@ -10,6 +10,14 @@ import { hashClickAction, navigationHref } from "./click-target.js";
 import { linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
 import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 
+/**
+ * True when an "Enter" keydown is really an IME confirming its composition
+ * (e.g. finalizing kanji conversion), not the user asking to submit.
+ */
+function isImeCommitEnter(event) {
+  return Boolean(event.isComposing || event.keyCode === 229);
+}
+
 const SAVE_DEBOUNCE_MS = 700;
 const EDIT_FLUSH_MS = 500;
 const MEDIA = /^(img|svg|canvas|video|picture|iframe|hr|figure)$/i;
@@ -1012,6 +1020,7 @@ function boot() {
   els.linkInput.addEventListener("keydown", (event) => {
     event.stopPropagation();
     if (event.key === "Enter") {
+      if (isImeCommitEnter(event)) return;
       event.preventDefault();
       applyLink();
     } else if (event.key === "Escape") {
