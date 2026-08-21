@@ -46,7 +46,7 @@ Review a page running on localhost:
 /human-review (localhost URL)
 ```
 
-Human Review opens the file in your browser. Make direct edits, leave comments, and click Send. Your agent receives all your feedback in one batch, updates the source, and refreshes the page for another review.
+Human Review opens the file in your browser. Make direct edits, leave comments, and click Send. If it's already fine, click **No change** — or just close the tab. Either one tells the waiting agent to stop polling instead of hanging until timeout. Your agent receives feedback in one batch, updates the source, and refreshes the page for another review.
 
 Note: For HTML files, direct edits and resizes save automatically. For Markdown and localhost pages, click Send so your agent can apply them to the source.
 
@@ -63,6 +63,7 @@ Note: For HTML files, direct edits and resizes save automatically. For Markdown 
 - **Remove elements** without explaining the deletion in chat.
 - **Command-click links** to review multiple pages without losing your feedback.
 - **Send every edit and comment at once** instead of writing a long chat message.
+- **No change** (or closing the tab) ends the review so the agent stops polling.
 
 I use Human Review to edit AI-generated plans, update landing pages, review localhost apps, and remove the extra copy AI likes to add to UX.
 

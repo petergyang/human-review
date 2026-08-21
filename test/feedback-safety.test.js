@@ -217,6 +217,7 @@ test("ending a review releases the waiting agent and keeps unsent feedback", asy
 
   const answer = JSON.parse((await polled).raw);
   assert.equal(answer.status, "closed", "the poller is released, not left to time out");
+  assert.equal(answer.reason, "no_change");
   assert.match(answer.next_step, /Stop polling/);
 
   const gone = await request(port, token, { route: `/api/session/${opened.sessionId}/page` });
@@ -224,6 +225,90 @@ test("ending a review releases the waiting agent and keeps unsent feedback", asy
 
   const page = j(await request(port, token, { route: `/api/page/${key}` }));
   assert.deepEqual(page.comments.map((c) => c.feedback), ["Unsent thought"], "unsent feedback survives the end");
+
+  const again = j(await request(port, token, { route: `/api/poll?target=${encodeURIComponent(file)}` }));
+  assert.equal(again.status, "closed", "a later poll on the same target stays closed");
+});
+
+function openSse(port, sessionId) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, method: "GET", path: `/events/${sessionId}` },
+      (res) => {
+        res.setEncoding("utf8");
+        res.once("data", () => resolve(req));
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("a later poll on an ended review stays closed, and a new session reopens it", async (t) => {
+  process.env.HUMAN_REVIEW_WINDOW_CLOSED_MS = "200";
+  const file = path.join(tmp, "reopen.html");
+  fs.writeFileSync(file, "<!DOCTYPE html>\n<html><head></head><body><p>Beta</p></body></html>\n");
+  const { port, token, dispose } = await start(0);
+  t.after(() => dispose());
+
+  const first = j(await request(port, token, { method: "POST", route: "/api/session", body: { file } }));
+  await request(port, token, { method: "POST", route: `/api/session/${first.sessionId}/end`, body: { reason: "no_change" } });
+  const closed = j(await request(port, token, { route: `/api/poll?target=${encodeURIComponent(file)}` }));
+  assert.equal(closed.status, "closed");
+
+  const second = j(await request(port, token, { method: "POST", route: "/api/session", body: { file } }));
+  let resolved = false;
+  const waiting = request(port, token, { route: `/api/poll?target=${encodeURIComponent(file)}` }).then((res) => {
+    resolved = true;
+    return res;
+  });
+  await sleep(150);
+  assert.equal(resolved, false, "a fresh session must clear the closed flag");
+
+  await request(port, token, { method: "POST", route: `/api/session/${second.sessionId}/end`, body: { reason: "no_change" } });
+  const batch = JSON.parse((await waiting).raw);
+  assert.equal(batch.status, "closed");
+});
+
+test("closing the last review tab releases the waiting agent", async (t) => {
+  process.env.HUMAN_REVIEW_WINDOW_CLOSED_MS = "200";
+  const file = path.join(tmp, "tab-close.html");
+  fs.writeFileSync(file, "<!DOCTYPE html>\n<html><head></head><body><p>Gamma</p></body></html>\n");
+  const { port, token, dispose } = await start(0);
+  t.after(() => dispose());
+
+  const opened = j(await request(port, token, { method: "POST", route: "/api/session", body: { file } }));
+  const polled = request(port, token, { route: `/api/poll?target=${encodeURIComponent(file)}` });
+  const sse = await openSse(port, opened.sessionId);
+  sse.destroy();
+  const answer = JSON.parse((await polled).raw);
+  assert.equal(answer.status, "closed");
+  assert.equal(answer.reason, "window_closed");
+});
+
+test("a refresh that reconnects before the grace window does not end the poll", async (t) => {
+  process.env.HUMAN_REVIEW_WINDOW_CLOSED_MS = "400";
+  const file = path.join(tmp, "refresh.html");
+  fs.writeFileSync(file, "<!DOCTYPE html>\n<html><head></head><body><p>Delta</p></body></html>\n");
+  const { port, token, dispose } = await start(0);
+  t.after(() => dispose());
+
+  const opened = j(await request(port, token, { method: "POST", route: "/api/session", body: { file } }));
+  let resolved = false;
+  const polled = request(port, token, { route: `/api/poll?target=${encodeURIComponent(file)}` }).then((res) => {
+    resolved = true;
+    return res;
+  });
+  const first = await openSse(port, opened.sessionId);
+  first.destroy();
+  await sleep(80);
+  const second = await openSse(port, opened.sessionId);
+  t.after(() => second.destroy());
+  await sleep(500);
+  assert.equal(resolved, false, "reconnect inside the grace window must keep the poller");
+  await request(port, token, { method: "POST", route: `/api/session/${opened.sessionId}/end` });
+  const answer = JSON.parse((await polled).raw);
+  assert.equal(answer.status, "closed");
 });
 
 test("poll --timeout rejects malformed values instead of waiting forever", async () => {

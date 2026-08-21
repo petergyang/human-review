@@ -281,6 +281,18 @@ body.collapsed .handle { right: 0; }
   border-radius: 6px;
 }
 .end-review:hover { color: var(--danger); background: var(--danger-soft); }
+.end-review.primary {
+  margin-top: 0;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--btn-bg);
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.end-review.primary:hover { filter: brightness(1.08); color: var(--btn-fg); background: var(--btn-bg); }
+.end-review:disabled { color: var(--faint); cursor: default; background: none; }
 
 .ended {
   position: fixed;
