@@ -2,9 +2,15 @@ node_modules/
 *.log
 *.tgz
 .DS_Store
+.env
 
 # Local review state, never committed
 .human-review/
+
+# Personal Claude Code overrides
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md
 
 # Claude Design runtime, not part of the product
 design-ref/support.js

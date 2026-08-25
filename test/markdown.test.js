@@ -156,4 +156,203 @@ test("a markdown review is rendered, flagged, and never writable", async (t) => 
   });
 });
 
+// --------------------------------------------------------------- diagram tests
+
+const { getPlantumlSource } = await import('../src/markdown.js');
+
+test('mermaid code block gets diagram wrapper and mermaid div', () => {
+  const html = renderMarkdownPage(
+    '# Diagrams\n\n```mermaid\ngraph TD\n  A-->B\n```\n',
+    '/x/doc.md',
+    'abc123'
+  );
+  const doc = new JSDOM(html).window.document;
+  const blocks = doc.querySelectorAll('.diagram-block');
+  assert.equal(blocks.length, 1);
+  assert.ok(blocks[0].querySelector('pre code.language-mermaid'), 'source pre is preserved');
+  const mermaidDiv = blocks[0].querySelector('div.mermaid');
+  assert.ok(mermaidDiv, 'mermaid render target exists');
+  assert.match(mermaidDiv.textContent, /graph TD/);
+});
+
+test('mermaid script is injected when mermaid blocks present', () => {
+  const html = renderMarkdownPage(
+    '```mermaid\ngraph TD; A-->B;\n```\n',
+    '/x/doc.md'
+  );
+  assert.match(html, /<script src="\/assets\/mermaid\.min\.js"><\/script>/);
+  assert.match(html, /mermaid\.initialize/);
+});
+
+test('mermaid script is NOT injected without mermaid blocks', () => {
+  const html = renderMarkdownPage(
+    '# Just text\n\n```js\nconsole.log("hi")\n```\n',
+    '/x/doc.md'
+  );
+  assert.doesNotMatch(html, /mermaid\.min\.js/);
+  assert.doesNotMatch(html, /mermaid\.initialize/);
+});
+
+test('plantuml code block gets img tag when configured', () => {
+  process.env.HUMAN_REVIEW_PLANTUML_JAR = '/fake/plantuml.jar';
+  try {
+    const html = renderMarkdownPage(
+      '# Diagrams\n\n```plantuml\n@startuml\nA-->B\n@enduml\n```\n',
+      '/x/doc.md',
+      'abc123'
+    );
+    const doc = new JSDOM(html).window.document;
+    const blocks = doc.querySelectorAll('.diagram-block');
+    assert.equal(blocks.length, 1);
+    assert.ok(blocks[0].querySelector('pre code.language-plantuml'), 'source pre is preserved');
+    const img = blocks[0].querySelector('img');
+    assert.ok(img, 'img tag exists for plantuml');
+    assert.match(img.getAttribute('src'), /\/plantuml-img\?key=abc123&index=0/);
+  } finally {
+    delete process.env.HUMAN_REVIEW_PLANTUML_JAR;
+  }
+});
+
+test('plantuml code block falls back to plain code when not configured', () => {
+  delete process.env.HUMAN_REVIEW_PLANTUML_JAR;
+  delete process.env.HUMAN_REVIEW_PLANTUML_URL;
+  const html = renderMarkdownPage(
+    '```plantuml\n@startuml\nA-->B\n@enduml\n```\n',
+    '/x/doc.md'
+  );
+  const doc = new JSDOM(html).window.document;
+  assert.equal(doc.querySelectorAll('.diagram-block').length, 0, 'no diagram wrapper when unconfigured');
+  assert.ok(doc.querySelector('pre code.language-plantuml'), 'source code block still present');
+});
+
+test('empty diagram code blocks do not get render targets', () => {
+  const html = renderMarkdownPage(
+    '```mermaid\n\n```\n\n```plantuml\n\n```\n',
+    '/x/doc.md'
+  );
+  const doc = new JSDOM(html).window.document;
+  assert.equal(doc.querySelectorAll('.diagram-block').length, 0, 'empty blocks get no wrapper');
+  assert.equal(doc.querySelectorAll('div.mermaid').length, 0, 'no mermaid div for empty source');
+});
+
+test('regular code blocks are unaffected by diagram processing', () => {
+  const html = renderMarkdownPage(
+    '```js\nconst x = 1;\n```\n\n```mermaid\ngraph TD\n```\n\n```python\nprint("hi")\n```\n',
+    '/x/doc.md'
+  );
+  const doc = new JSDOM(html).window.document;
+  assert.equal(doc.querySelectorAll('.diagram-block').length, 1, 'only mermaid gets wrapped');
+  assert.ok(doc.querySelector('pre code.language-js'), 'js block unaffected');
+  assert.ok(doc.querySelector('pre code.language-python'), 'python block unaffected');
+});
+
+test('mixed mermaid and plantuml on same page both render', () => {
+  process.env.HUMAN_REVIEW_PLANTUML_JAR = '/fake/plantuml.jar';
+  try {
+    const html = renderMarkdownPage(
+      '```mermaid\ngraph TD\n```\n\n```plantuml\n@startuml\nA-->B\n@enduml\n```\n',
+      '/x/doc.md',
+      'key1'
+    );
+    const doc = new JSDOM(html).window.document;
+    const blocks = doc.querySelectorAll('.diagram-block');
+    assert.equal(blocks.length, 2);
+    assert.ok(blocks[0].querySelector('div.mermaid'), 'first block is mermaid');
+    assert.ok(blocks[1].querySelector('img'), 'second block is plantuml');
+    assert.match(html, /mermaid\.min\.js/, 'mermaid script injected');
+    assert.match(html, /mermaid\.initialize/, 'mermaid init injected');
+  } finally {
+    delete process.env.HUMAN_REVIEW_PLANTUML_JAR;
+  }
+});
+
+test('getPlantumlSource returns source stored by renderMarkdownPage', () => {
+  process.env.HUMAN_REVIEW_PLANTUML_JAR = '/fake/plantuml.jar';
+  try {
+    renderMarkdownPage(
+      '```plantuml\n@startuml\nX-->Y\n@enduml\n```\n\n```plantuml\n@startuml\nY-->Z\n@enduml\n```\n',
+      '/x/doc.md',
+      'key1'
+    );
+    assert.equal(getPlantumlSource('key1', 0), '@startuml\nX-->Y\n@enduml');
+    assert.equal(getPlantumlSource('key1', 1), '@startuml\nY-->Z\n@enduml');
+    assert.equal(getPlantumlSource('key1', 2), undefined);
+    assert.equal(getPlantumlSource('nonexistent', 0), undefined);
+  } finally {
+    delete process.env.HUMAN_REVIEW_PLANTUML_JAR;
+  }
+});
+
+test('plantuml code block with URL config also works', () => {
+  process.env.HUMAN_REVIEW_PLANTUML_URL = 'https://plantuml.example.com/render';
+  try {
+    const html = renderMarkdownPage(
+      '```plantuml\n@startuml\nA-->B\n@enduml\n```\n',
+      '/x/doc.md',
+      'urlkey'
+    );
+    const doc = new JSDOM(html).window.document;
+    const img = doc.querySelector('.diagram-block img');
+    assert.ok(img, 'img tag exists');
+    assert.match(img.getAttribute('src'), /\/plantuml-img\?key=urlkey&index=0/);
+  } finally {
+    delete process.env.HUMAN_REVIEW_PLANTUML_URL;
+  }
+});
+
+// ---------------------------------------------------------- server route tests
+
+test('GET /assets/mermaid.min.js serves the vendored file', async (t) => {
+  const { port, token, dispose } = await start();
+  t.after(() => dispose());
+  const res = await request(port, token, { route: '/assets/mermaid.min.js' });
+  assert.equal(res.status, 200);
+  assert.ok(res.raw.length > 1000, 'response is substantial (not an error page)');
+});
+
+test('GET /plantuml-img returns 400 when not configured', async (t) => {
+  // Populate the source store first (render with PlantUML configured, then unset).
+  process.env.HUMAN_REVIEW_PLANTUML_JAR = '/fake/plantuml.jar';
+  try {
+    renderMarkdownPage(
+      '```plantuml\n@startuml\nA-->B\n@enduml\n```\n',
+      '/x/doc.md',
+      'noconfig'
+    );
+  } finally {
+    delete process.env.HUMAN_REVIEW_PLANTUML_JAR;
+  }
+
+  // Now the source exists but neither env var is set.
+  const { port, token, dispose } = await start();
+  t.after(() => dispose());
+  const res = await request(port, token, { route: '/plantuml-img?key=noconfig&index=0' });
+  assert.equal(res.status, 400);
+  assert.match(JSON.parse(res.raw).error, /not configured/i);
+});
+
+test('GET /plantuml-img returns 400 for missing params', async (t) => {
+  const { port, token, dispose } = await start();
+  t.after(() => dispose());
+  const noKey = await request(port, token, { route: '/plantuml-img?index=0' });
+  assert.equal(noKey.status, 400);
+  const noIndex = await request(port, token, { route: '/plantuml-img?key=abc' });
+  assert.equal(noIndex.status, 400);
+});
+
+test('GET /plantuml-img returns 400 for invalid index', async (t) => {
+  const { port, token, dispose } = await start();
+  t.after(() => dispose());
+  const res = await request(port, token, { route: '/plantuml-img?key=abc&index=bad' });
+  assert.equal(res.status, 400);
+});
+
+test('GET /plantuml-img works without token (route is outside /api/ gate)', async (t) => {
+  const { port, dispose } = await start();
+  t.after(() => dispose());
+  // Should get 400 (unknown source) not 401 (auth) — img tags can't send headers.
+  const res = await request(port, '', { route: '/plantuml-img?key=abc&index=0' });
+  assert.equal(res.status, 400);
+});
+
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));

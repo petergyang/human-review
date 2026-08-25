@@ -2,10 +2,11 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { atomicWrite, Store, resolveAsset } from "./state.js";
 import { injectSdk, stripSdk } from "./html-transform.js";
-import { isMarkdown, renderMarkdownPage } from "./markdown.js";
+import { isMarkdown, renderMarkdownPage, getPlantumlSource } from "./markdown.js";
 import { canonicalTarget, ensureStateDir, localUrl, SERVER_PROTOCOL, serverPath, stateDir, targetKey } from "./paths.js";
 import { invocation, shellQuote } from "./setup.js";
 
@@ -92,6 +93,51 @@ async function fetchLocalPage(target, redirects = 0) {
     throw new Error(`Expected an HTML page from localhost, but received ${contentType || "an unknown content type"}.`);
   }
   return { html: await readCapped(response, url), resolvedUrl: response.url || url };
+}
+
+// -------------------------------------------------------- PlantUML rendering
+
+async function renderPlantumlWithJar(source, jar) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("java", [
+      "-Djava.awt.headless=true",
+      "-jar", jar,
+      "-pipe", "-tpng",
+    ], { stdio: ["pipe", "pipe", "pipe"], timeout: 15000 });
+
+    const chunks = [];
+    let stderr = "";
+
+    proc.stdout.on("data", (chunk) => chunks.push(chunk));
+    proc.stderr.on("data", (chunk) => { stderr += chunk; });
+
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`PlantUML exited with code ${code}: ${stderr.slice(0, 500)}`));
+      } else {
+        resolve(Buffer.concat(chunks));
+      }
+    });
+    proc.on("error", reject);
+
+    proc.stdin.write(source);
+    proc.stdin.end();
+  });
+}
+
+async function renderPlantumlWithUrl(source, url) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "text/plain; charset=utf-8" },
+    body: source,
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "(body unreadable)");
+    throw new Error(`PlantUML server returned ${response.status}: ${body.slice(0, 500)}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 export function createServer() {
@@ -470,6 +516,48 @@ export function createServer() {
         return res.end("Forbidden");
       }
 
+      // --- PlantUML server-side rendering (before token gate — images can't send headers)
+      if (route === "/plantuml-img" && req.method === "GET") {
+        const srcKey = url.searchParams.get("key");
+        const indexStr = url.searchParams.get("index");
+        if (!srcKey || indexStr === null) {
+          return json(res, 400, { error: "missing key or index" });
+        }
+        const index = parseInt(indexStr, 10);
+        if (!Number.isFinite(index) || index < 0) {
+          return json(res, 400, { error: "invalid index" });
+        }
+
+        const source = getPlantumlSource(srcKey, index);
+        if (source === undefined) {
+          return json(res, 400, { error: "unknown diagram source" });
+        }
+
+        const jar = process.env.HUMAN_REVIEW_PLANTUML_JAR;
+        const plantumlUrl = process.env.HUMAN_REVIEW_PLANTUML_URL;
+
+        if (!jar && !plantumlUrl) {
+          return json(res, 400, { error: "PlantUML is not configured. Set HUMAN_REVIEW_PLANTUML_JAR or HUMAN_REVIEW_PLANTUML_URL." });
+        }
+
+        try {
+          let png;
+          if (jar) {
+            png = await renderPlantumlWithJar(source, jar);
+          } else {
+            png = await renderPlantumlWithUrl(source, plantumlUrl);
+          }
+          res.writeHead(200, {
+            "content-type": "image/png",
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+          });
+          return res.end(png);
+        } catch (err) {
+          return json(res, 500, { error: String(err.message || err) });
+        }
+      }
+
       if (route === "/health") return json(res, 200, { ok: true, pid: process.pid, protocol: SERVER_PROTOCOL });
 
       // Every API route needs the per-run token; static assets and the
@@ -493,6 +581,7 @@ export function createServer() {
       if (route === "/frame-policy.js") return serveFile(res, path.join(here, "frame-policy.js"), CORS);
       if (route === "/click-target.js") return serveFile(res, path.join(here, "click-target.js"), CORS);
       if (route === "/serialize.js") return serveFile(res, path.join(here, "serialize.js"), CORS);
+      if (route === "/assets/mermaid.min.js") return serveFile(res, path.join(here, "..", "assets", "mermaid.min.js"));
 
       // --- open a browser session for a file or localhost URL
       if (route === "/api/session" && req.method === "POST") {
@@ -562,7 +651,7 @@ export function createServer() {
               return res.end("File is gone");
             }
             // Markdown reviews render on the fly; the source file stays untouched.
-            if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
+            if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file, page.key);
           }
           res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" });
           return res.end(injectSdk(html, key, sdkOptions));
@@ -615,6 +704,7 @@ export function createServer() {
           unsent: { comments, edits },
         });
       }
+
 
       // --- page data
       const pageMatch = route.match(/^\/api\/page\/([a-f0-9]+)(?:\/(\w+))?(?:\/(.+))?$/);

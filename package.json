@@ -17,6 +17,7 @@
   },
   "files": [
     "src",
+    "assets/mermaid.min.js",
     "README.md",
     "LICENSE"
   ],
