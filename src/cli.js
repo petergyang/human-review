@@ -115,8 +115,12 @@ async function openCommand(input) {
     console.error(body.error || "Could not open that file.");
     process.exit(1);
   }
-  const url = `http://127.0.0.1:${server.port}${body.path}`;
-  openBrowser(url);
+  const publicUrl = process.env.HUMAN_REVIEW_PUBLIC_URL;
+  const publicHost = publicUrl || `http://127.0.0.1:${server.port}`;
+  const url = `${publicHost}${body.path}`;
+  // The local machine's browser can't reach the phone's view of the app, so
+  // opening it here is noise — print the URL and let the phone do the opening.
+  if (!publicUrl) openBrowser(url);
   console.log(`Reviewing ${target.kind === "url" ? target.value : path.basename(target.value)}`);
   console.log(url);
   console.log(`\nWaiting for feedback? Run:\n  human-review poll ${shellQuote(target.value)}`);

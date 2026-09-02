@@ -25,6 +25,7 @@
   --btn-bg: #1b1a16;
   --btn-fg: #fbfaf7;
   --rail-w: 352px;
+  --sheet-h: clamp(300px, 55vh, 520px);
 }
 
 :root[data-theme="dark"] {
@@ -74,48 +75,100 @@ body {
 
 button, textarea { font: inherit; color: inherit; }
 
-.app { display: flex; height: 100vh; }
+.app { height: 100vh; }
 
-/* The artifact takes all remaining width and styles itself. */
-.stage { flex: 1; min-width: 0; background: var(--canvas); }
+/* The artifact takes the whole viewport; the rail floats over it. */
+.stage { height: 100%; width: 100%; background: var(--canvas); }
 #frame { width: 100%; height: 100%; border: 0; display: block; background: #fff; }
 
+/* Bottom-sheet toggle: a centered grabber tab that rides the sheet's top
+   edge when open, and drops to the bottom edge when closed. */
 .handle {
   position: fixed;
-  top: 50%;
-  right: var(--rail-w);
-  z-index: 40;
-  width: 22px;
-  height: 46px;
-  margin-top: -23px;
+  left: 50%;
+  bottom: var(--sheet-h);
+  transform: translateX(-50%);
+  z-index: 50;
+  width: 76px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
   border: 1px solid var(--hair);
-  border-right: 0;
-  border-radius: 7px 0 0 7px;
+  border-bottom: 0;
+  border-radius: 12px 12px 0 0;
   background: var(--rail);
   color: var(--mute);
   font-size: 11px;
   line-height: 1;
   cursor: pointer;
-  box-shadow: -2px 0 8px -6px rgba(0, 0, 0, 0.28);
-  transition: right 140ms ease-out;
+  box-shadow: 0 -4px 14px -8px rgba(0, 0, 0, 0.3);
+  transition: bottom 200ms ease-out;
 }
 .handle:hover { color: var(--strong-txt); background: var(--soft); }
+body.collapsed .handle { bottom: 0; }
 
+/* Bottom-sheet rail: floats over the artifact, never disturbs the page. */
 .rail {
-  flex: none;
-  width: var(--rail-w);
+  position: fixed;
+  left: 50%;
+  bottom: 0;
+  width: min(720px, 100%);
+  height: var(--sheet-h);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-left: 1px solid var(--hair);
+  border-top: 1px solid var(--hair);
+  border-radius: 14px 14px 0 0;
   background: var(--rail);
-  transition: width 140ms ease-out;
+  box-shadow: 0 -10px 34px rgba(0, 0, 0, 0.16);
+  transform: translate(-50%, 105%);
+  transition: transform 200ms ease-out;
+  z-index: 40;
 }
-body.collapsed .rail { width: 0; border-left-width: 0; }
-body.collapsed .handle { right: 0; }
+body:not(.collapsed) .rail { transform: translate(-50%, 0); }
+
+/* Desktop: keep the classic right-side rail. The mobile bottom sheet applies
+   below this width; the handle returns to a right-edge tab and the rail
+   becomes a fixed-width flex column that the artifact shares the row with. */
+@media (min-width: 900px) {
+  .app { display: flex; height: 100vh; }
+  .stage { flex: 1; min-width: 0; width: auto; }
+
+  .handle {
+    top: 50%;
+    bottom: auto;
+    left: auto;
+    right: var(--rail-w);
+    transform: none;
+    width: 22px;
+    height: 46px;
+    margin-top: -23px;
+    border: 1px solid var(--hair);
+    border-right: 0;
+    border-radius: 7px 0 0 7px;
+    box-shadow: -2px 0 8px -6px rgba(0, 0, 0, 0.28);
+    transition: right 140ms ease-out;
+  }
+  body.collapsed .handle { right: 0; }
+
+  .rail {
+    position: static;
+    left: auto;
+    bottom: auto;
+    width: var(--rail-w);
+    height: auto;
+    flex: none;
+    transform: none;
+    border-top: 0;
+    border-left: 1px solid var(--hair);
+    border-radius: 0;
+    box-shadow: none;
+    transition: width 140ms ease-out;
+  }
+  body:not(.collapsed) .rail { transform: none; }
+  body.collapsed .rail { width: 0; border-left-width: 0; }
+}
 
 .rail-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 12px 12px; }
 
