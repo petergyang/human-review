@@ -189,3 +189,68 @@ test("localhost image pastes are staged, previewed, and delivered to the agent",
   await acknowledged.body.cancel();
   assert.equal(fs.existsSync(stagedPath), false, "the staged copy is removed after the agent acknowledges the batch");
 });
+
+test("server start sweeps staged pastes that no edit or batch still references", async (t) => {
+  const app = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end('<!doctype html><html><body><p data-block="Intro">Hello</p></body></html>');
+  });
+  await new Promise((resolve, reject) => {
+    app.once("error", reject);
+    app.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => app.close());
+
+  // Paste once so a staged file is referenced by a live edit, then plant
+  // orphans beside it and under a key no page owns any more.
+  const first = await start();
+  const target = `http://localhost:${app.address().port}/wiki`;
+  const opened = JSON.parse(
+    (
+      await request(first.port, {
+        method: "POST",
+        route: "/api/session",
+        headers: { "x-human-review-token": first.token, "content-type": "application/json" },
+        body: JSON.stringify({ target }),
+      })
+    ).raw
+  );
+  const asset = JSON.parse(
+    (
+      await request(first.port, {
+        method: "POST",
+        route: `/api/page/${opened.key}/asset?type=${encodeURIComponent("image/png")}`,
+        headers: { "x-human-review-token": first.token, "content-type": "application/octet-stream" },
+        body: PNG,
+      })
+    ).raw
+  );
+  await request(first.port, {
+    method: "POST",
+    route: `/api/page/${opened.key}/edit`,
+    headers: { "x-human-review-token": first.token, "content-type": "application/json" },
+    body: JSON.stringify({
+      label: "Intro",
+      kind: "edited",
+      before: "Hello",
+      after: "Hello",
+      after_html: `<p data-block="Intro">Hello<img src="${asset.src}"></p>`,
+      staged_assets: [{ id: asset.stagedId, preview_src: asset.src }],
+    }),
+  });
+  await first.dispose();
+
+  const stagedRoot = path.join(process.env.HUMAN_REVIEW_STATE_DIR, "pasted");
+  const kept = path.join(stagedRoot, opened.key, asset.stagedId);
+  const orphanBeside = path.join(stagedRoot, opened.key, "localhost-paste-9.png");
+  const orphanDir = path.join(stagedRoot, "no-such-page");
+  fs.writeFileSync(orphanBeside, PNG);
+  fs.mkdirSync(orphanDir, { recursive: true });
+  fs.writeFileSync(path.join(orphanDir, "localhost-paste-1.png"), PNG);
+
+  const second = await start();
+  t.after(() => second.dispose());
+  assert.equal(fs.existsSync(kept), true, "a staged file referenced by a live edit survives");
+  assert.equal(fs.existsSync(orphanBeside), false, "an unreferenced file next to it is removed");
+  assert.equal(fs.existsSync(orphanDir), false, "a staging folder for a forgotten page is removed");
+});
