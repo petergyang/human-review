@@ -39,6 +39,9 @@ const WATCH_INTERVAL_MS = 400;
 const IDLE_SHUTDOWN_MS = Number(process.env.HUMAN_REVIEW_IDLE_MS || 45 * 60 * 1000);
 /** A window with no live connection this long is treated as closed for good. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
+/** Last SSE client gone this long → the human closed the tab. Short enough that
+ *  a close actually ends the poll; long enough that a refresh can reconnect. */
+const windowClosedMs = () => Number(process.env.HUMAN_REVIEW_WINDOW_CLOSED_MS || 4000);
 const MAX_LOCAL_REDIRECTS = 5;
 /** Generous enough for a dev server's cold compile, but a wedged one can't hang us forever. */
 const LOCAL_FETCH_TIMEOUT_MS = 30000;
@@ -156,6 +159,8 @@ export function createServer() {
   const sessions = new Map(); // sessionId -> { id, entryKey, activeKey, visited, clients:Set<res>, lastSeen }
   /** Agent long-polls, keyed by the entry page they were started on. */
   const pollers = new Map(); // entryKey -> Set<{ res, timer }>
+  /** Human finished this review (No change, End review, or they closed the tab). */
+  const closed = new Map(); // entryKey -> { reason, at, batch }
   /** Pending batches awaiting --ack; mirrored to the store so they survive restarts. */
   const batches = new Map(
     Object.entries(store.allBatches()).map(([key, record]) => [key, { batch: record.batch, cleanup: record.cleanup, delivered: false }])
@@ -192,6 +197,7 @@ export function createServer() {
    * Feedback sent with nothing listening is "stranded", and the browser says so.
    */
   function agentState(entryKey) {
+    if (closed.has(entryKey)) return "closed";
     const pending = batches.get(entryKey);
     if (pending && pending.delivered) return "working";
     const set = pollers.get(entryKey);
@@ -376,12 +382,41 @@ export function createServer() {
     return true;
   }
 
+  function closedBatch(reason) {
+    return {
+      status: "closed",
+      reason,
+      next_step:
+        "The user ended this review session. Stop polling — do not run the poll command again. " +
+        "Any unsent feedback is kept and will ship the next time this target is reviewed.",
+    };
+  }
+
+  function releasePollers(entryKey, payload) {
+    const set = pollers.get(entryKey);
+    if (!set) return;
+    for (const poller of [...set]) {
+      clearInterval(poller.timer);
+      set.delete(poller);
+      poller.res.end(JSON.stringify(payload));
+    }
+  }
+
+  function closeEntry(entryKey, reason) {
+    const batch = closedBatch(reason);
+    closed.set(entryKey, { reason, at: Date.now(), batch });
+    releasePollers(entryKey, batch);
+    broadcastAgent(entryKey);
+  }
+
   /**
-   * A deliberate stop, not a tab close: the browser forgets the session and
-   * any waiting agent is released with a clear "stop polling" answer instead
-   * of being left to burn its timeout. Unsent feedback stays in the store.
+   * A deliberate stop: the browser forgets the session and any waiting agent
+   * is released with a clear "stop polling" answer instead of being left to
+   * burn its timeout. Unsent feedback stays in the store. Closing the last
+   * tab uses the same path after a short grace, so a refresh can reconnect.
    */
-  function endSession(session) {
+  function endSession(session, reason = "no_change") {
+    clearTimeout(session.closeTimer);
     sessions.delete(session.id);
     for (const res of session.clients) {
       res.write(`event: ended\ndata: {}\n\n`);
@@ -390,20 +425,18 @@ export function createServer() {
     session.clients.clear();
     // Another window on the same target keeps its agent connection alive.
     if (sessionsForEntry(session.entryKey).length > 0) return;
-    const set = pollers.get(session.entryKey);
-    if (!set) return;
-    for (const poller of [...set]) {
-      clearInterval(poller.timer);
-      set.delete(poller);
-      poller.res.end(
-        JSON.stringify({
-          status: "closed",
-          next_step:
-            "The user ended this review session. Stop polling — do not run the poll command again. " +
-            "Any unsent feedback is kept and will ship the next time this target is reviewed.",
-        })
-      );
-    }
+    closeEntry(session.entryKey, reason);
+  }
+
+  function scheduleWindowClosed(session) {
+    clearTimeout(session.closeTimer);
+    session.closeTimer = setTimeout(() => {
+      if (!sessions.has(session.id)) return;
+      if (session.clients.size > 0) return;
+      const live = sessionsForEntry(session.entryKey).some((s) => s.clients.size > 0);
+      if (live) return;
+      endSession(session, "window_closed");
+    }, windowClosedMs());
   }
 
   // ----------------------------------------------------------------- routes
@@ -558,7 +591,16 @@ export function createServer() {
         }
         watchPage(page.key);
         const id = uid("s");
-        sessions.set(id, { id, entryKey: page.key, activeKey: page.key, visited: new Set([page.key]), clients: new Set(), lastSeen: Date.now() });
+        closed.delete(page.key);
+        sessions.set(id, {
+          id,
+          entryKey: page.key,
+          activeKey: page.key,
+          visited: new Set([page.key]),
+          clients: new Set(),
+          lastSeen: Date.now(),
+          closeTimer: null,
+        });
         return json(res, 200, { sessionId: id, key: page.key, path: `/s/${id}` });
       }
 
@@ -654,8 +696,10 @@ export function createServer() {
           comments += page.comments.length;
           edits += page.edits.length;
         }
+        const finished = closed.get(entryKey);
         return json(res, 200, {
-          status: pending ? "feedback-waiting" : "idle",
+          status: pending ? "feedback-waiting" : finished ? "closed" : "idle",
+          ...(finished ? { reason: finished.reason } : {}),
           feedback_waiting: !!pending,
           agent_listening: listening,
           server_running: true,
@@ -841,8 +885,10 @@ export function createServer() {
       if (endMatch && req.method === "POST") {
         const session = sessions.get(endMatch[1]);
         if (!session) return json(res, 404, { error: "unknown session" });
-        endSession(session);
-        return json(res, 200, { ok: true });
+        const body = await readBody(req).catch(() => ({}));
+        const reason = body.reason === "window_closed" ? "window_closed" : "no_change";
+        endSession(session, reason);
+        return json(res, 200, { ok: true, status: "closed", reason });
       }
 
       // --- which page a window is currently showing
@@ -918,12 +964,14 @@ export function createServer() {
         res.write(": open\n\n");
         session.clients.add(res);
         seen(session);
+        clearTimeout(session.closeTimer);
         emit(session, "agent", { state: agentState(session.entryKey) });
         const beat = setInterval(() => res.write(": beat\n\n"), POLL_HEARTBEAT_MS);
         req.on("close", () => {
           clearInterval(beat);
           session.clients.delete(res);
           seen(session);
+          if (session.clients.size === 0 && sessions.has(session.id)) scheduleWindowClosed(session);
         });
         return undefined;
       }
@@ -933,6 +981,9 @@ export function createServer() {
         const target = url.searchParams.get("target") || url.searchParams.get("file") || "";
         const entryKey = targetKey(target);
         if (url.searchParams.get("ack") === "1") ack(entryKey);
+
+        const finished = closed.get(entryKey);
+        if (finished) return json(res, 200, finished.batch);
 
         const pending = batches.get(entryKey);
         if (pending) {

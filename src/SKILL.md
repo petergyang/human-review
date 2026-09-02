@@ -28,7 +28,8 @@ keeping its formatting syntax.
    npx -y human-review http://localhost:3000/wiki
    ```
 
-3. Wait for feedback. This blocks until they hit Send, or the timeout passes:
+3. Wait for feedback. This blocks until they hit **Send**, hit **No change**,
+   close the review tab, or the timeout passes:
 
    ```sh
    npx -y human-review poll path/to/file.html --timeout 600
@@ -36,21 +37,28 @@ keeping its formatting syntax.
 
    Keep this command in the foreground. Do not end your turn while it is waiting.
    If your shell returns a process or session handle, keep waiting on that handle
-   until the command exits. If it prints `{"status":"timeout"}`, no feedback has
-   arrived yet — run the same poll command again to keep waiting. Feedback is
-   saved even if a poll dies, so nothing is ever lost.
+   until the command exits.
 
-   If it prints `{"status":"closed"}`, the user ended the review from the
-   browser — stop polling and do not run the poll command again. Unsent
-   feedback is kept and ships the next time this target is reviewed.
+   **Stop polling. Do not run poll again when:**
+   - it prints `{"status":"closed"}` — they hit No change or closed the tab
+   - they say they are done in chat (kill any still-running poll)
 
-4. Apply what comes back, then wait again. `--ack` clears the batch you just handled:
+   **Timeout:** if it prints `{"status":"timeout"}`, run `npx -y human-review status <file>`
+   first. If status is `closed`, stop. If the user has moved on in chat, stop and
+   kill the poll. Only re-poll if you are still waiting on this review.
+
+   Never leave a poll running in the background after the review is over.
+   Closing the browser is a decision: it ends the review.
+
+4. Apply what comes back, then wait again. `--ack` clears a **feedback** batch:
 
    ```sh
    npx -y human-review poll path/to/file.html --ack --timeout 600
    ```
 
-Repeat 3–4 until the user says they are done.
+   Do **not** `--ack` a `closed` batch. That review is finished.
+
+Repeat 3–4 until the user is done (`closed`, or they say so).
 
 Not sure whether feedback is already waiting — say, at the start of a new turn?
 This answers instantly without blocking:
@@ -60,6 +68,7 @@ npx -y human-review status path/to/file.html
 ```
 
 It prints `{"status": "feedback-waiting"}` when a batch is ready for a poll,
+`{"status": "closed"}` when they finished with no further changes,
 plus counts of unsent comments and edits still in the browser.
 
 ## What you get
@@ -88,6 +97,20 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   "overall_note": "feedback not tied to any one page"
 }
 ```
+
+A finished review with nothing to apply looks like:
+
+```json
+{
+  "status": "closed",
+  "reason": "no_change",
+  "next_step": "The user ended this review session. Stop polling — do not run the poll command again."
+}
+```
+
+`reason` is `no_change` (they clicked No change) or `window_closed` (they
+closed the tab). Either way: stop. Unsent comments from a closed tab are kept
+and ship the next time this target is reviewed.
 
 ## Rules
 

@@ -22,6 +22,7 @@ const state = {
   save: "idle",
   savedAt: "",
   sent: false,
+  closed: false,
   orphans: new Set(),
   pollCommand: "",
   editsExpanded: false,
@@ -303,10 +304,14 @@ function render() {
   // note-only batches; the button must not stay dead while one is typed.
   const hasNote = $("note").value.trim().length > 0;
   const send = $("send");
+  const end = $("endReview");
   const delivered = state.agent === "working";
   const stranded = state.agent === "stranded";
-  const busy = delivered || stranded || state.sent;
-  send.disabled = (total === 0 && !hasNote) || busy;
+  const finished = state.agent === "closed" || state.closed;
+  const busy = delivered || stranded || state.sent || finished;
+  const empty = total === 0 && !hasNote;
+  send.disabled = empty || busy;
+  send.hidden = empty && !busy && !delivered && !stranded && !state.sent;
   send.textContent = delivered
     ? "Feedback delivered"
     : stranded
@@ -318,12 +323,19 @@ function render() {
           : hasNote
             ? "Send note to agent"
             : "Nothing to send yet";
-  if (!send.disabled) {
+  if (!send.disabled && !send.hidden) {
     const key = document.createElement("span");
     key.className = "key";
     key.textContent = "⌘⏎";
     send.append(" ", key);
   }
+
+  end.disabled = busy;
+  end.classList.toggle("primary", empty && !busy);
+  end.textContent = finished ? "Review ended" : empty ? "No change" : "End review";
+  end.title = empty
+    ? "Looks good — end the review without comments"
+    : "Stop this review and release the waiting agent";
 
   // After sending, say what happens next. If nothing is polling, the loop would
   // otherwise dead-end silently, so hand over the exact command to run.
@@ -701,14 +713,22 @@ $("endReview").addEventListener("click", async () => {
   const page = state.page;
   const otherTotal = (state.others || []).reduce((sum, o) => sum + o.count, 0);
   const unsent = page ? (page.comments || []).length + (page.edits || []).length + otherTotal : 0;
-  const message = unsent
-    ? `End this review? ${unsent} unsent ${unsent === 1 ? "item" : "items"} will be kept for next time.`
-    : "End this review? The waiting agent will be told to stop polling.";
-  if (!window.confirm(message)) return;
+  const hasNote = $("note").value.trim().length > 0;
+  if (unsent || hasNote) {
+    const message = unsent
+      ? `End this review? ${unsent} unsent ${unsent === 1 ? "item" : "items"} will be kept for next time.`
+      : "End this review? The waiting agent will be told to stop polling.";
+    if (!window.confirm(message)) return;
+  }
   // Ship anything still sitting in the SDK's debounce windows first.
   await flushFrame();
   try {
-    await api(`/api/session/${state.sessionId}/end`, { method: "POST" });
+    await api(`/api/session/${state.sessionId}/end`, {
+      method: "POST",
+      body: JSON.stringify({ reason: "no_change" }),
+    });
+    state.closed = true;
+    state.agent = "closed";
     showEnded();
   } catch (err) {
     toast(err.message);
@@ -766,7 +786,8 @@ document.addEventListener("keydown", (event) => {
   const meta = event.metaKey || event.ctrlKey;
   if (meta && event.key === "Enter") {
     event.preventDefault();
-    if (!$("send").disabled) $("send").click();
+    if (!$("send").disabled && !$("send").hidden) $("send").click();
+    else if (!$("endReview").disabled) $("endReview").click();
     return;
   }
   // ⌘S is reassurance only: flush pending keystrokes, never a state change.

@@ -188,7 +188,9 @@ async function pollCommand(input, { ack = false, timeoutSecs = 0 } = {}) {
   const server = await ensureServer();
 
   const label = /^https?:\/\//i.test(target) ? target : path.basename(target);
-  process.stderr.write(`Waiting for feedback on ${label} — comment in the browser, then hit Send.\n`);
+  process.stderr.write(
+    `Waiting for feedback on ${label} — comment and hit Send, or hit No change if it's fine.\n`
+  );
 
   const deadline = timeoutSecs ? Date.now() + timeoutSecs * 1000 : null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
