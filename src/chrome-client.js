@@ -650,7 +650,9 @@ $("composeCancel").addEventListener("click", cancelCompose);
 
 // Clicking anywhere on the card is the "I meant to comment" gesture.
 $("compose").addEventListener("mousedown", (event) => {
-  if (event.target.closest("button")) return;
+  // The textarea handles its own clicks — swallowing them would pin the caret
+  // to the end and make repositioning it impossible.
+  if (event.target.closest("button, textarea")) return;
   event.preventDefault();
   $("composeText").focus();
 });

@@ -383,7 +383,8 @@ function targetFor(node) {
   }
 
   if (!pinnedLabels.has(block)) {
-    const heading = precedingHeading(block);
+    // A heading names itself; the heading before it would mislabel the edit.
+    const heading = /^h[1-6]$/i.test(block.tagName) ? "" : precedingHeading(block);
     const tag = block.tagName.toLowerCase();
     // Siblings of the same tag would otherwise share a label and collapse into
     // one edit row, so number them.
@@ -769,7 +770,8 @@ function boot() {
       }
 
       // Plain clicks belong to editing: never navigate, never fire artifact JS.
-      if (href || (event.target.closest && event.target.closest("button, [role='button'], summary"))) {
+      // A <summary> keeps its native toggle: collapsed content must stay reachable.
+      if (href || (event.target.closest && event.target.closest("button, [role='button']"))) {
         event.preventDefault();
         event.stopPropagation();
       }
