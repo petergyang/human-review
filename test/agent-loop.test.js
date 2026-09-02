@@ -176,7 +176,17 @@ test("an open-ended poll reconnects when the server is replaced underneath it", 
     });
     await request(record, "POST", `/api/page/${opened.body.key}/send`, { sessionId: opened.body.sessionId, note: "" });
 
-    const result = await collect(poll);
+    // A poll that attached to the wrong server would wait forever; fail
+    // loudly instead of stalling the whole suite.
+    const result = await Promise.race([
+      collect(poll),
+      new Promise((_, reject) =>
+        setTimeout(() => {
+          poll.kill();
+          reject(new Error(`the reconnected poll never received the batch: ${stderr}`));
+        }, 30000)
+      ),
+    ]);
     assert.equal(result.code, 0, result.stderr);
     const batch = JSON.parse(result.stdout);
     assert.equal(batch.status, "feedback");

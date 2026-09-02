@@ -226,7 +226,9 @@ async function pollCommand(input, { ack = false, timeoutSecs = 0 } = {}) {
       failures += 1;
       if (bounded && failures >= 3) break;
       process.stderr.write(`Lost the connection (${err.message}); reconnecting.\n`);
-      await sleep(Math.min(2000 * failures, 10000));
+      // Long enough for a replacement server to announce itself first, so
+      // this does not race it by spawning a second one.
+      await sleep(Math.min(3000 * failures, 10000));
       server = await ensureServer();
       continue;
     }
