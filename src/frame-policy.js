@@ -1,4 +1,4 @@
-const BASE_SANDBOX = "allow-scripts allow-forms allow-modals allow-popups allow-downloads";
+const BASE_SANDBOX = "allow-scripts allow-forms allow-modals";
 
 /**
  * Localhost apps need their real origin so their routing and JavaScript work.
