@@ -39,6 +39,8 @@ const state = {
   reloading: false,
   dynamic: false,
   framePolicy: null,
+  artifactToken: "",
+  leftover: null,
 };
 
 /**
@@ -49,7 +51,7 @@ const state = {
 function handoffPrompt(pollCommand) {
   const cmd = String(pollCommand || "").trim();
   if (!cmd) return "";
-  return `Run \`${cmd} --timeout 600\`, apply the feedback it returns, then keep polling with --ack until I end the review.`;
+  return `Start \`${cmd}\` in the background and end your turn; it exits when I hit Send. Apply the feedback it prints, then start it again with --ack.`;
 }
 
 // ------------------------------------------------------------------- server
@@ -80,7 +82,26 @@ const toFrame = (message) =>
 
 function artifactUrl(key, bust = false) {
   const query = bust ? `?t=${Date.now()}` : "";
-  return `${ARTIFACT_ORIGIN}/artifact/${key}/index.html${query}`;
+  return `${ARTIFACT_ORIGIN}/artifact/${state.artifactToken}/${key}/index.html${query}`;
+}
+
+/**
+ * The server forgot this session — it restarted, or the tab was away longer
+ * than the session lives. Open a fresh session on the same target so the
+ * page keeps working instead of turning into a dead tab that looks alive.
+ */
+async function rebootstrap() {
+  const target = state.page ? state.page.url || state.page.file : "";
+  if (!target) return false;
+  try {
+    const fresh = await api("/api/session", { method: "POST", body: JSON.stringify({ target }) });
+    state.sessionId = fresh.sessionId;
+    state.artifactToken = fresh.artifactToken || state.artifactToken;
+    history.replaceState(null, "", fresh.path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -185,8 +206,15 @@ function render() {
     sep.textContent = "·";
     const when = document.createElement("span");
     when.className = "when";
-    when.textContent = ago(comment.createdAt);
+    when.textContent = ago(comment.updatedAt || comment.createdAt);
     who.append(sep, when);
+
+    if (comment.updatedAt) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "edited";
+      who.append(badge);
+    }
 
     if (state.orphans.has(comment.id)) {
       const badge = document.createElement("span");
@@ -204,6 +232,15 @@ function render() {
       setActive(comment.id, true);
     });
 
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "jump edit-comment";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      editComment(card, body, comment);
+    });
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "remove";
@@ -216,8 +253,6 @@ function render() {
       state.page = (await api(`/api/page/${state.key}/comment/${comment.id}`, { method: "DELETE" })).page;
       render();
     });
-
-    head.append(who, jump, remove);
 
     const quote = document.createElement("p");
     quote.className = "quote";
@@ -232,6 +267,7 @@ function render() {
       editComment(card, body, comment);
     });
 
+    head.append(who, jump, edit, remove);
     card.append(head, quote, body);
     card.addEventListener("click", () => setActive(comment.id, false));
     list.append(card);
@@ -314,20 +350,25 @@ function render() {
   const hasNote = $("note").value.trim().length > 0;
   const send = $("send");
   const delivered = state.agent === "working";
+  const queued = state.agent === "queued";
   const stranded = state.agent === "stranded";
-  const busy = delivered || stranded || state.sent;
+  // While the agent works, anything new can still be sent: it queues behind
+  // the batch in flight and ships with the agent's next poll.
+  const busy = stranded || state.sent || (queued && total === 0 && !hasNote);
   send.disabled = (total === 0 && !hasNote) || busy;
-  send.textContent = delivered
-    ? "Feedback delivered"
-    : stranded
-      ? "Sent — agent is not listening"
-      : state.sent
-        ? "Sent — waiting for agent"
-        : total
-          ? `Send ${total} to agent`
-          : hasNote
-            ? "Send note to agent"
-            : "Nothing to send yet";
+  send.textContent = stranded
+    ? "Sent — agent is not listening"
+    : state.sent
+      ? queued
+        ? "Sent — queued for the agent"
+        : delivered
+          ? "Feedback delivered"
+          : "Sent — waiting for agent"
+      : total
+        ? `Send ${total} to agent`
+        : hasNote
+          ? "Send note to agent"
+          : "Nothing to send yet";
   if (!send.disabled) {
     const key = document.createElement("span");
     key.className = "key";
@@ -337,8 +378,23 @@ function render() {
 
   // After sending, say what happens next. If nothing is polling, the loop would
   // otherwise dead-end silently, so hand over the exact command to run.
-  $("agentLine").hidden = !delivered;
-  $("agentText").textContent = "Feedback delivered — page reloads when fixes land";
+  $("agentLine").hidden = !(delivered || queued);
+  $("agentText").textContent = queued
+    ? "Agent is still on your last batch — this one ships with its next poll"
+    : "Feedback delivered — page reloads when fixes land";
+
+  // --- feedback left over from an earlier review of this page
+  const leftover = state.leftover;
+  const leftoverBox = $("leftover");
+  const leftoverTotal = leftover ? leftover.comments + leftover.edits : 0;
+  leftoverBox.hidden = !leftoverTotal;
+  if (leftoverTotal) {
+    const parts = [];
+    if (leftover.comments) parts.push(`${leftover.comments} ${leftover.comments === 1 ? "comment" : "comments"}`);
+    if (leftover.edits) parts.push(`${leftover.edits} ${leftover.edits === 1 ? "edit" : "edits"}`);
+    const savedNote = page.kind === "file" && !page.markdown ? " Text edits are already in the file either way." : "";
+    $("leftoverText").textContent = `${parts.join(" and ")} from your last review never went to the agent.${savedNote}`;
+  }
 
   // Server-authoritative, so it survives a browser refresh.
   $("handoff").hidden = !stranded;
@@ -389,11 +445,19 @@ function editComment(card, body, comment) {
     const feedback = input.value.trim();
     if (!feedback || feedback === comment.feedback) return render();
     try {
-      state.page = (await api(`/api/page/${state.key}/comment/${comment.id}`, {
+      const result = await api(`/api/page/${state.key}/comment/${comment.id}`, {
         method: "PATCH",
         body: JSON.stringify({ feedback }),
-      })).page;
-      state.sent = false;
+      });
+      state.page = result.page;
+      if (result.delivery === "updated-pending") toast("Updated the feedback waiting for your agent");
+      else if (result.delivery === "resend") {
+        state.sent = false;
+        toast("The agent already has the old wording — this version ships with your next Send");
+        // The retired id no longer marks anything; the new one takes over.
+        toFrame({ type: "eh:remove", id: comment.id });
+        toFrame({ type: "eh:anchors", comments: state.page.comments });
+      } else state.sent = false;
     } catch (err) {
       toast(err.message);
     }
@@ -418,12 +482,41 @@ function editComment(card, body, comment) {
   input.setSelectionRange(input.value.length, input.value.length);
 }
 
-function toast(message) {
+function toast(message, { action = "", onAction = null, ms = 3200 } = {}) {
   const el = document.createElement("div");
   el.className = "toast";
   el.textContent = message;
+  if (action && onAction) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "toast-action";
+    button.textContent = action;
+    button.addEventListener("click", () => {
+      el.remove();
+      onAction();
+    });
+    el.append(button);
+  }
   document.body.append(el);
-  setTimeout(() => el.remove(), 3200);
+  setTimeout(() => el.remove(), ms);
+}
+
+/**
+ * Edit rows post asynchronously; an undo must land after the row it reverses,
+ * or the DELETE clears nothing and the row ships anyway.
+ */
+let editChain = Promise.resolve();
+
+function undoBlock(label, kind) {
+  toFrame({ type: "eh:undo", label, kind });
+  editChain = editChain.then(async () => {
+    try {
+      state.page = (await api(`/api/page/${state.key}/edit`, { method: "DELETE", body: JSON.stringify({ label, kind }) })).page;
+      render();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
 }
 
 function setActive(id, scroll) {
@@ -564,22 +657,32 @@ window.addEventListener("message", async (event) => {
       toast("That comment is not visible in this view");
       break;
     case "eh:edit":
-      state.page = (await api(`/api/page/${state.key}/edit`, {
-        method: "POST",
-        body: JSON.stringify({
-          label: msg.label,
-          kind: msg.kind,
-          before: msg.before,
-          after: msg.after,
-          before_html: msg.before_html,
-          after_html: msg.after_html,
-          moved_after: msg.moved_after,
-          moved_before: msg.moved_before,
-          staged_assets: msg.staged_assets,
-        }),
-      })).page;
-      state.sent = false;
-      render();
+      editChain = editChain.then(async () => {
+        state.page = (await api(`/api/page/${state.key}/edit`, {
+          method: "POST",
+          body: JSON.stringify({
+            label: msg.label,
+            kind: msg.kind,
+            before: msg.before,
+            after: msg.after,
+            before_html: msg.before_html,
+            after_html: msg.after_html,
+            moved_after: msg.moved_after,
+            moved_before: msg.moved_before,
+            staged_assets: msg.staged_assets,
+          }),
+        })).page;
+        state.sent = false;
+        render();
+      });
+      await editChain.catch((err) => toast(err.message));
+      break;
+    case "eh:undoable":
+      toast(msg.kind === "moved" ? `Moved “${tidy(msg.label, 40)}”` : `Deleted “${tidy(msg.label, 40)}”`, {
+        action: "Undo",
+        ms: 8000,
+        onAction: () => undoBlock(msg.label, msg.kind),
+      });
       break;
     case "eh:asset":
       try {
@@ -609,7 +712,11 @@ window.addEventListener("message", async (event) => {
       renderSave();
       break;
     case "eh:dynamic":
-      state.dynamic = true;
+      if (!state.dynamic) {
+        state.dynamic = true;
+        // The batch says whether edits are on disk; a self-rendering page's are not.
+        api(`/api/page/${state.key}/mode`, { method: "POST", body: JSON.stringify({ dynamic: true }) }).catch(() => {});
+      }
       renderSave();
       break;
     case "eh:flushed":
@@ -701,8 +808,23 @@ $("revert").addEventListener("click", async () => {
   }
 });
 
+$("leftoverKeep").addEventListener("click", () => {
+  state.leftover = null;
+  render();
+});
+
+$("leftoverDiscard").addEventListener("click", async () => {
+  try {
+    await api(`/api/page/${state.key}/discard`, { method: "POST" });
+    state.leftover = null;
+    await loadPage(state.key);
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
 /** The session is over: freeze the page and say so. Feedback is already safe. */
-function showEnded() {
+function showEnded(message) {
   if (document.querySelector(".ended")) return;
   if (events) events.close();
   clearTimeout(retryTimer);
@@ -711,10 +833,23 @@ function showEnded() {
   const title = document.createElement("h2");
   title.textContent = "Review ended";
   const line = document.createElement("p");
-  line.textContent = "Unsent feedback is saved and ships next time you review this page. You can close this tab.";
+  line.textContent = message || "Unsent feedback is kept; next time you open this page you can restore or discard it. You can close this tab.";
   overlay.append(title, line);
   document.body.append(overlay);
 }
+
+// A closing tab says so, and the review ends unless it comes right back (a
+// reload). keepalive lets the request outlive the page; sendBeacon cannot
+// carry the token header.
+window.addEventListener("pagehide", () => {
+  try {
+    fetch(`/api/session/${state.sessionId}/away`, {
+      method: "POST",
+      keepalive: true,
+      headers: { "x-human-review-token": state.token },
+    }).catch(() => {});
+  } catch {}
+});
 
 $("endReview").addEventListener("click", async () => {
   const page = state.page;
@@ -806,8 +941,15 @@ let events = null;
 function connect() {
   const source = new EventSource(`/events/${state.sessionId}`);
   events = source;
-  // Another window on this session hit End review.
-  source.addEventListener("ended", () => showEnded());
+  // Another window on this session hit End review, or the server gave up on
+  // a tab that never came back.
+  source.addEventListener("ended", (event) => {
+    let reason = "ended";
+    try {
+      reason = JSON.parse(event.data).reason || reason;
+    } catch {}
+    showEnded(reason === "window_closed" ? "This tab was away too long, so the review ended. Unsent feedback is kept; reopen the page to restore or discard it." : undefined);
+  });
   source.addEventListener("reload", () => {
     const hadEdits = state.page ? state.page.edits.length : 0;
     state.reloading = true;
@@ -837,7 +979,14 @@ function connect() {
     render();
   });
   source.onerror = () => {
-    /* EventSource reconnects on its own. */
+    // A dropped connection reconnects on its own. A refused one (the server
+    // forgot this session) never will, so open a fresh session instead.
+    if (source.readyState !== EventSource.CLOSED) return;
+    source.close();
+    rebootstrap().then((ok) => {
+      if (ok) connect();
+      else showEnded("This review session expired. Run human-review on this page again to reopen it.");
+    });
   };
 }
 
@@ -850,8 +999,14 @@ function connect() {
   } catch {}
 
   const bootstrap = await api(`/api/session/${state.sessionId}/page`).catch(() => null);
-  if (bootstrap && bootstrap.page) state.pollCommand = bootstrap.page.pollCommand;
-  const key = bootstrap ? bootstrap.key : new URLSearchParams(location.search).get("key");
-  await loadPage(key);
+  if (!bootstrap) {
+    showEnded("This review session has ended. Run human-review on the page again to reopen it.");
+    return;
+  }
+  if (bootstrap.page) state.pollCommand = bootstrap.page.pollCommand;
+  state.artifactToken = bootstrap.artifactToken || "";
+  const leftover = bootstrap.leftover || { comments: 0, edits: 0 };
+  state.leftover = leftover.comments + leftover.edits ? leftover : null;
+  await loadPage(bootstrap.key);
   connect();
 })();

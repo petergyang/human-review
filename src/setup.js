@@ -69,7 +69,10 @@ it as a static file. Then start
 blocks until the user hits Send, prints the \`{"status":"feedback"}\` batch,
 and exits, which wakes you. Do not add \`--timeout\` and do not poll on an
 interval. Apply the batch, then start the next background poll with \`--ack\`.
-\`{"status":"closed"}\` means the user ended the review; do not poll again.
+\`{"status":"closed"}\` means the review is over (ended, tab closed, or none
+open); do not poll again, and if its \`unsent\` counts are not zero, tell the user
+in one line. \`{"status":"superseded"}\` means a newer poll of yours owns the
+wait; stop this one silently.
 
 Only if your harness cannot wake you when a background command exits, keep the
 poll in the foreground (or wait on the process handle it returns) until it
@@ -85,6 +88,8 @@ Markdown source, keeping its syntax. There is no reply channel; the user sees
 your work when the page reloads. For a localhost page, direct edits and deletions
 arrive with \`kind: "url"\`; find and update the matching MDX, TSX, template, or
 component source. Never write the rendered HTTP response over project source.
+A page with \`edits_saved: true\` already has those edits on disk: re-read the
+file and make targeted changes only, never regenerate it from an older copy.
 `;
 
 export function installSkills(cwd, { global: isGlobal = false, home = os.homedir() } = {}) {

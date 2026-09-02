@@ -178,12 +178,16 @@ function writeStdout(text) {
   return new Promise((resolve) => process.stdout.write(text, resolve));
 }
 
-function printTimeout(waitedSecs) {
+/** An open-ended wait still ends eventually: a forgotten tab must not pin a process for days. */
+const MAX_OPEN_WAIT_MS = 12 * 60 * 60 * 1000;
+
+function printTimeout(waitedSecs, { capped = false } = {}) {
   const payload = {
     status: "timeout",
     waited_seconds: waitedSecs,
-    next_step:
-      "No feedback yet. Run the same poll command again to keep waiting, or `human-review status <target>` to check without blocking.",
+    next_step: capped
+      ? "Nothing arrived in 12 hours. Run `human-review status <target>`: if the review is still open, start the same background poll again; otherwise stop."
+      : "No feedback yet. Run the same poll command again to keep waiting, or `human-review status <target>` to check without blocking.",
   };
   return writeStdout(`${JSON.stringify(payload, null, 2)}\n`);
 }
@@ -205,26 +209,29 @@ async function pollCommand(input, { ack = false, timeoutSecs = 0 } = {}) {
   const label = /^https?:\/\//i.test(target) ? target : path.basename(target);
   process.stderr.write(`Waiting for feedback on ${label} — comment in the browser, then hit Send.\n`);
 
-  const deadline = timeoutSecs ? Date.now() + timeoutSecs * 1000 : null;
+  const bounded = timeoutSecs > 0;
+  const started = Date.now();
+  const deadline = bounded ? started + timeoutSecs * 1000 : started + MAX_OPEN_WAIT_MS;
+  const timedOut = () => printTimeout(bounded ? timeoutSecs : Math.round((Date.now() - started) / 1000), { capped: !bounded });
   // The ack rides on the first request that actually reaches the server.
   let ackPending = ack;
   let failures = 0;
   for (;;) {
-    const remaining = deadline ? deadline - Date.now() : 0;
-    if (deadline && remaining <= 0) return printTimeout(timeoutSecs);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return timedOut();
     let result;
     try {
       result = await pollOnce(server, target, ackPending, remaining);
     } catch (err) {
       failures += 1;
-      if (deadline && failures >= 3) break;
+      if (bounded && failures >= 3) break;
       process.stderr.write(`Lost the connection (${err.message}); reconnecting.\n`);
       await sleep(Math.min(2000 * failures, 10000));
       server = await ensureServer();
       continue;
     }
     ackPending = false;
-    if (result.kind === "timeout") return printTimeout(timeoutSecs);
+    if (result.kind === "timeout") return timedOut();
     if (result.raw) {
       try {
         const batch = JSON.parse(result.raw);
@@ -237,7 +244,7 @@ async function pollCommand(input, { ack = false, timeoutSecs = 0 } = {}) {
     // An empty or garbled answer means the server closed the request without
     // a batch; wait a beat so a misbehaving server cannot spin this loop.
     failures += 1;
-    if (deadline && failures >= 3) break;
+    if (bounded && failures >= 3) break;
     await sleep(500);
   }
   process.stderr.write("Gave up waiting for feedback.\n");
