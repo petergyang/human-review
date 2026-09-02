@@ -19,3 +19,14 @@ test("file and Markdown reviews use an opaque origin", () => {
     assert.equal(policy.targetOrigin, "*");
   }
 });
+
+test("no review grants the frame popups or downloads", () => {
+  // The SDK hands external links to the chrome over postMessage, which opens
+  // them itself, so the frame never needs allow-popups. Nothing needs
+  // allow-downloads. Untrusted artifacts get neither.
+  for (const page of [{ kind: "url" }, { kind: "file", markdown: false }, { kind: "file", markdown: true }]) {
+    const policy = framePolicy(page, artifactOrigin);
+    assert.doesNotMatch(policy.sandbox, /\ballow-popups\b/);
+    assert.doesNotMatch(policy.sandbox, /\ballow-downloads\b/);
+  }
+});

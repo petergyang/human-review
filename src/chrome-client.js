@@ -6,6 +6,7 @@
  */
 import { tidy } from "./anchor-text.js";
 import { pageUrl, replacePage } from "./chrome-session.js";
+import { normalizeHref } from "./editing.js";
 import { framePolicy } from "./frame-policy.js";
 
 const $ = (id) => document.getElementById(id);
@@ -607,9 +608,14 @@ window.addEventListener("message", async (event) => {
     case "eh:scroll":
       state.scroll = { x: msg.x, y: msg.y };
       break;
-    case "eh:external":
-      window.open(msg.href, "_blank", "noopener");
+    case "eh:external": {
+      // This side is what actually calls window.open, so it re-checks the
+      // scheme rather than trusting the frame: a javascript: or data: URL
+      // arriving here would run on this origin, next to the token.
+      const external = normalizeHref(msg.href);
+      if (external) window.open(external, "_blank", "noopener");
       break;
+    }
     case "eh:navigate":
       try {
         const result = await api(`/api/session/${state.sessionId}/navigate`, {
