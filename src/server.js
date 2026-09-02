@@ -44,6 +44,14 @@ const MAX_LOCAL_REDIRECTS = 5;
 const LOCAL_FETCH_TIMEOUT_MS = 30000;
 const MAX_LOCAL_PAGE_BYTES = 24 * 1024 * 1024;
 
+/**
+ * File reviews may contain agent-generated or otherwise untrusted JavaScript.
+ * Only the nonce-bearing Human Review SDK may execute in those artifacts;
+ * authored scripts and inline event handlers remain in the source but stay inert.
+ */
+const fileReviewCsp = (nonce) =>
+  `script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`;
+
 const hash = (text) => crypto.createHash("sha1").update(text).digest("hex");
 const uid = (prefix) => `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
 
@@ -589,6 +597,7 @@ export function createServer() {
         if (!asset || asset === "index.html") {
           let html = "";
           let sdkOptions = {};
+          let extraHeaders = {};
           if (page.kind === "url") {
             try {
               const fetched = await fetchLocalPage(page.url);
@@ -610,8 +619,11 @@ export function createServer() {
             }
             // Markdown reviews render on the fly; the source file stays untouched.
             if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
+            const nonce = crypto.randomBytes(18).toString("base64");
+            sdkOptions = { nonce };
+            extraHeaders = { "content-security-policy": fileReviewCsp(nonce) };
           }
-          res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" });
+          res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store", ...extraHeaders });
           return res.end(injectSdk(html, key, sdkOptions));
         }
         if (page.kind === "url") {

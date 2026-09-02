@@ -26,7 +26,7 @@ function request(port, { method = "GET", route = "/", headers = {}, body = null 
         res.on("data", (chunk) => {
           raw += chunk;
         });
-        res.on("end", () => resolve({ status: res.statusCode, raw }));
+        res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, raw }));
       }
     );
     req.on("error", reject);
@@ -98,6 +98,31 @@ test("the local server refuses strangers", async (t) => {
     });
     assert.equal(res.status, 200);
     assert.match(JSON.parse(res.raw).html, /<p>Hi<\/p>/);
+  });
+
+  await t.test("file reviews execute only the nonce-authorized SDK", async () => {
+    const hostile = '<!doctype html><html><body><h1>Review me</h1><script>parent.postMessage({type:"eh:html",html:"owned"},"*")</script><button onclick="alert(1)">Comment target</button></body></html>';
+    fs.writeFileSync(file, hostile);
+    const opened = await request(port, {
+      method: "POST",
+      route: "/api/session",
+      headers: { "x-human-review-token": token },
+      body: { file },
+    });
+    const { key } = JSON.parse(opened.raw);
+    const artifact = await request(port, { route: `/artifact/${key}/index.html` });
+
+    assert.equal(artifact.status, 200);
+    const csp = artifact.headers["content-security-policy"] || "";
+    const nonce = /script-src 'nonce-([^']+)'/.exec(csp)?.[1];
+    assert.ok(nonce, "file review response has a one-time script nonce");
+    assert.match(csp, /'strict-dynamic'/);
+    assert.match(csp, /object-src 'none'/);
+    assert.equal(artifact.raw.split(`nonce="${nonce}"`).length - 1, 1, "only the SDK receives the nonce");
+    assert.ok(artifact.raw.includes(`<script data-eh-sdk type="module" nonce="${nonce}"`));
+    assert.match(artifact.raw, /<script>parent\.postMessage/, "authored script stays present but CSP blocks it");
+    assert.match(artifact.raw, /onclick="alert\(1\)"/, "commentable authored elements remain in the page");
+    assert.equal(fs.readFileSync(file, "utf8"), hostile, "serving the safe review does not rewrite the file");
   });
 
   await t.test("the server record keeps its token private", () => {

@@ -20,6 +20,15 @@ test("injectSdk adds exactly one script before </body>", () => {
   assert.ok(out.includes('src="/sdk.js?key=abc123"'));
 });
 
+test("injectSdk gives only its trusted script the supplied nonce", () => {
+  const page = '<!DOCTYPE html><html><body><script>parent.postMessage({type:"eh:html"}, "*")</script></body></html>';
+  const out = injectSdk(page, "abc123", { nonce: "one-time-permission" });
+  assert.match(out, /<script data-eh-sdk type="module" nonce="one-time-permission" src="\/sdk\.js\?key=abc123"><\/script>/);
+  assert.equal((out.match(/nonce="one-time-permission"/g) || []).length, 1);
+  assert.match(out, /<script>parent\.postMessage/, "the authored script remains in the source representation");
+  assert.equal(stripSdk(out), page, "saving restores the original script bytes");
+});
+
 test("injecting twice never stacks tags", () => {
   const once = injectSdk(PAGE, "abc123");
   const twice = injectSdk(once, "abc123");

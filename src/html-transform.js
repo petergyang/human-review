@@ -20,10 +20,12 @@ function absolutizeAssets(html, baseHref) {
  * Add the review bootstrap tags. Everything else about the artifact is left
  * byte-identical, so the saved file renders the same standalone.
  */
-export function injectSdk(html, key, { src = `/sdk.js?key=${encodeURIComponent(key)}`, baseHref = "" } = {}) {
+export function injectSdk(html, key, { src = `/sdk.js?key=${encodeURIComponent(key)}`, baseHref = "", nonce = "" } = {}) {
   const clean = stripSdk(html);
   const escapedSrc = String(src).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-  const tag = `<script data-eh-sdk type="module" src="${escapedSrc}"></script>`;
+  const escapedNonce = String(nonce).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+  const nonceAttr = escapedNonce ? ` nonce="${escapedNonce}"` : "";
+  const tag = `<script data-eh-sdk type="module"${nonceAttr} src="${escapedSrc}"></script>`;
   let prepared = clean;
   if (baseHref) {
     const url = new URL(baseHref);
