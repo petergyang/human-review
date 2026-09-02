@@ -80,9 +80,16 @@ async function waitForServer(notPid) {
 }
 
 async function stop(child) {
+  if (child.exitCode !== null) return;
+  child.kill();
+  // Windows occasionally never reports the exit of a terminated child; a
+  // bounded wait keeps one stuck handle from stalling the whole file.
+  await Promise.race([once(child, "exit"), new Promise((resolve) => setTimeout(resolve, 5000))]);
   if (child.exitCode === null) {
-    child.kill();
-    await once(child, "exit");
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+    await Promise.race([once(child, "exit"), new Promise((resolve) => setTimeout(resolve, 2000))]);
   }
 }
 
@@ -204,10 +211,11 @@ test("an open-ended poll reconnects when the server is replaced underneath it", 
     assert.equal(batch.pages[0].comments[0].feedback, "Still here after the restart.");
     assert.match(stderr + result.stderr, /reconnecting/);
   } finally {
-    mark("cleanup");
+    mark(`cleanup: third exit=${third.exitCode} killed=${third.killed}; fourth exit=${fourth && fourth.exitCode} killed=${fourth && fourth.killed}`);
     await stop(third);
+    mark("third stop returned");
     if (fourth) await stop(fourth);
-    mark("done");
+    mark(`done: fourth exit=${fourth && fourth.exitCode}`);
   }
 });
 
