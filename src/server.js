@@ -94,8 +94,55 @@ async function fetchLocalPage(target, redirects = 0) {
   return { html: await readCapped(response, url), resolvedUrl: response.url || url };
 }
 
+/**
+ * Staged localhost pastes are deleted when their batch is acked. A batch that
+ * never gets acked (the agent died, the page was pruned) would leave them
+ * behind forever, so on start drop every staged file that no live edit or
+ * pending batch still refers to.
+ */
+function sweepStagedPastes(store) {
+  const root = path.join(stateDir(), "pasted");
+  let keys;
+  try {
+    keys = fs.readdirSync(root);
+  } catch {
+    return;
+  }
+  const live = new Set();
+  for (const page of Object.values(store.data.pages)) {
+    for (const edit of page.edits || []) {
+      for (const asset of edit.staged_assets || []) live.add(path.resolve(asset.path));
+    }
+  }
+  for (const record of Object.values(store.allBatches())) {
+    for (const entry of record.cleanup || []) {
+      for (const file of entry.staged || []) live.add(path.resolve(file));
+    }
+  }
+  for (const key of keys) {
+    const dir = path.join(root, key);
+    let files;
+    try {
+      files = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      const full = path.join(dir, file);
+      if (live.has(path.resolve(full))) continue;
+      try {
+        fs.unlinkSync(full);
+      } catch {}
+    }
+    try {
+      fs.rmdirSync(dir);
+    } catch {}
+  }
+}
+
 export function createServer() {
   const store = new Store();
+  sweepStagedPastes(store);
   const cliInvocation = invocation();
 
   /**
