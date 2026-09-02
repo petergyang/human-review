@@ -147,6 +147,7 @@ const clock = () => new Date().toLocaleTimeString([], { hour: "numeric", minute:
 function render() {
   const page = state.page;
   if (!page) return;
+  document.title = page.filename || 'human-review';
 
   const comments = page.comments || [];
   const edits = page.edits || [];
