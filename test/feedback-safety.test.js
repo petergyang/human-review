@@ -152,6 +152,7 @@ test("a comment can be reworded before it is sent", async (t) => {
   });
   assert.equal(reworded.status, 200);
   assert.deepEqual(j(reworded).page.comments.map((c) => c.feedback), ["Sharper thoughts"]);
+  assert.equal(typeof j(reworded).page.comments[0].updatedAt, "number");
 
   const missing = await request(port, token, { method: "PATCH", route: `/api/page/${key}/comment/c_nope`, body: { feedback: "x" } });
   assert.equal(missing.status, 404);
@@ -162,6 +163,56 @@ test("a comment can be reworded before it is sent", async (t) => {
   await request(port, token, { method: "POST", route: `/api/page/${key}/send`, body: { sessionId: opened.sessionId, note: "" } });
   const batch = JSON.parse((await request(port, token, { route: `/api/poll?target=${encodeURIComponent(file)}` })).raw);
   assert.deepEqual(batch.pages[0].comments.map((c) => c.feedback), ["Sharper thoughts"]);
+  await ackAndAbandon(port, token, file);
+});
+
+test("rewording replaces a waiting batch and becomes a correction after delivery", async (t) => {
+  const file = path.join(tmp, "reword-after-send.html");
+  fs.writeFileSync(file, "<!DOCTYPE html><html><body><p>Draft</p></body></html>");
+  const { port, token, dispose } = await start(0);
+  t.after(() => dispose());
+
+  const opened = j(await request(port, token, { method: "POST", route: "/api/session", body: { file } }));
+  const added = j(await request(port, token, {
+    method: "POST",
+    route: `/api/page/${opened.key}/comment`,
+    body: { kind: "selection", quote: "Draft", feedback: "Delete this" },
+  }));
+
+  // Nothing is polling yet, so editing should replace the stranded batch in place.
+  await request(port, token, { method: "POST", route: `/api/page/${opened.key}/send`, body: { sessionId: opened.sessionId, note: "" } });
+  const waitingEdit = j(await request(port, token, {
+    method: "PATCH",
+    route: `/api/page/${opened.key}/comment/${added.comment.id}`,
+    body: { feedback: "Shorten this" },
+  }));
+  assert.equal(waitingEdit.delivery, "updated-pending");
+
+  const delivered = j(await request(port, token, { route: `/api/poll?target=${encodeURIComponent(file)}` }));
+  assert.equal(delivered.pages[0].comments[0].feedback, "Shorten this", "the agent never sees the superseded wording");
+
+  // Once delivered, a further revision must survive ack as an explicit correction.
+  const correction = j(await request(port, token, {
+    method: "PATCH",
+    route: `/api/page/${opened.key}/comment/${added.comment.id}`,
+    body: { feedback: "Keep it, but add an example" },
+  }));
+  assert.equal(correction.delivery, "correction");
+  assert.equal(correction.page.comments[0].correction, true);
+  assert.equal(correction.page.comments[0].correctionOf, "Shorten this");
+  assert.notEqual(correction.page.comments[0].id, added.comment.id, "the delivered id is retired so ack cannot clear the correction");
+
+  await ackAndAbandon(port, token, file);
+  const afterAck = j(await request(port, token, { route: `/api/page/${opened.key}` }));
+  assert.equal(afterAck.comments.length, 1);
+  assert.equal(afterAck.comments[0].feedback, "Keep it, but add an example");
+
+  await request(port, token, { method: "POST", route: `/api/page/${opened.key}/send`, body: { sessionId: opened.sessionId, note: "" } });
+  const correctedBatch = j(await request(port, token, { route: `/api/poll?target=${encodeURIComponent(file)}` }));
+  const shipped = correctedBatch.pages[0].comments[0];
+  assert.equal(shipped.correction, true);
+  assert.equal(shipped.correction_of, "Shorten this");
+  assert.match(correctedBatch.next_step, /replace their `correction_of` instruction/);
   await ackAndAbandon(port, token, file);
 });
 

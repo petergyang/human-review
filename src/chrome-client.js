@@ -5,7 +5,7 @@
  * hostname: a separate origin that can never reach this page or its token.
  */
 import { tidy } from "./anchor-text.js";
-import { pageUrl, replacePage } from "./chrome-session.js";
+import { newestComments, pageUrl, replacePage } from "./chrome-session.js";
 import { framePolicy } from "./frame-policy.js";
 
 const $ = (id) => document.getElementById(id);
@@ -139,7 +139,7 @@ function render() {
   const page = state.page;
   if (!page) return;
 
-  const comments = page.comments || [];
+  const comments = newestComments(page.comments);
   const edits = page.edits || [];
 
   $("count").textContent = String(comments.length);
@@ -175,8 +175,20 @@ function render() {
     sep.textContent = "·";
     const when = document.createElement("span");
     when.className = "when";
-    when.textContent = ago(comment.createdAt);
+    when.textContent = ago(comment.updatedAt || comment.createdAt);
     who.append(sep, when);
+
+    if (comment.correction) {
+      const badge = document.createElement("span");
+      badge.className = "badge correction";
+      badge.textContent = "correction";
+      who.append(badge);
+    } else if (comment.updatedAt) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "edited";
+      who.append(badge);
+    }
 
     if (state.orphans.has(comment.id)) {
       const badge = document.createElement("span");
@@ -194,6 +206,15 @@ function render() {
       setActive(comment.id, true);
     });
 
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "jump edit-comment";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      editComment(card, body, comment);
+    });
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "remove";
@@ -207,8 +228,6 @@ function render() {
       render();
     });
 
-    head.append(who, jump, remove);
-
     const quote = document.createElement("p");
     quote.className = "quote";
     quote.textContent = tidy(comment.quote, 140);
@@ -221,6 +240,8 @@ function render() {
       event.stopPropagation();
       editComment(card, body, comment);
     });
+
+    head.append(who, jump, edit, remove);
 
     card.append(head, quote, body);
     card.addEventListener("click", () => setActive(comment.id, false));
@@ -379,11 +400,21 @@ function editComment(card, body, comment) {
     const feedback = input.value.trim();
     if (!feedback || feedback === comment.feedback) return render();
     try {
-      state.page = (await api(`/api/page/${state.key}/comment/${comment.id}`, {
+      const result = await api(`/api/page/${state.key}/comment/${comment.id}`, {
         method: "PATCH",
         body: JSON.stringify({ feedback }),
-      })).page;
-      state.sent = false;
+      });
+      state.page = result.page;
+      if (result.delivery === "updated-pending") {
+        toast("Updated the feedback waiting for your agent");
+      } else if (result.delivery === "correction") {
+        state.sent = false;
+        toFrame({ type: "eh:remove", id: comment.id });
+        toFrame({ type: "eh:anchors", comments: state.page.comments });
+        toast("Saved as a correction — send it after the current batch is acknowledged");
+      } else {
+        state.sent = false;
+      }
     } catch (err) {
       toast(err.message);
     }

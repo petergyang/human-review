@@ -254,6 +254,7 @@ body.collapsed .handle { right: 0; }
   cursor: pointer;
 }
 .jump:hover { color: var(--strong-txt); }
+.edit-comment { margin-left: 0; }
 .remove {
   width: 18px;
   height: 18px;
@@ -321,6 +322,7 @@ body.collapsed .handle { right: 0; }
   font-size: 10px;
   font-weight: 600;
 }
+.badge.correction { background: var(--danger-soft); color: var(--danger); }
 
 .empty {
   padding: 16px 14px;

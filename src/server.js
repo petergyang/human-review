@@ -269,6 +269,7 @@ export function createServer() {
           quote: c.quote,
           anchor: c.anchor,
           feedback: c.feedback,
+          ...(c.correction ? { correction: true, correction_of: c.correctionOf } : {}),
         })),
         edits: page.edits.map((e) => ({
           label: e.label,
@@ -304,6 +305,7 @@ export function createServer() {
 
     const hasMarkdown = pages.some((p) => p.kind === "file" && isMarkdown(p.file));
     const hasUrl = pages.some((p) => p.kind === "url");
+    const hasCorrections = pages.some((p) => p.comments.some((c) => c.correction));
     const batch = {
       status: "feedback",
       pages: pages.map(({ kind, file, url, comments, edits }) => ({ kind, file, ...(url ? { url } : {}), comments, edits })),
@@ -323,6 +325,9 @@ export function createServer() {
             "and apply every exact edit or deletion there; never try to write the rendered HTML response back to the app. " +
             "When an edit includes `staged_assets`, copy each local image into the app's appropriate asset folder, replace its " +
             "temporary preview URL in `after_html`, and preserve the image at the user's insertion point. "
+          : "") +
+        (hasCorrections
+          ? "Comments marked `correction` replace their `correction_of` instruction; follow the correction and do not apply the older wording. "
           : "") +
         "When every page is updated, run the same poll command again with --ack to clear this " +
         "batch and wait for more.",
@@ -720,8 +725,37 @@ export function createServer() {
           const body = await readBody(req);
           const feedback = String(body.feedback || "").trim();
           if (!feedback) return json(res, 400, { error: "empty feedback" });
-          if (!store.updateComment(key, tail, feedback)) return json(res, 404, { error: "unknown comment" });
-          return json(res, 200, { page: pageState(key) });
+          const existing = store.page(key).comments.find((comment) => comment.id === tail);
+          if (!existing) return json(res, 404, { error: "unknown comment" });
+
+          const matchingCleanup = (record) =>
+            record.cleanup.some((item) => item.key === key && item.ids.includes(tail));
+          const wasDelivered = [...batches.values()].some((record) => record.delivered && matchingCleanup(record));
+
+          if (wasDelivered) {
+            // The agent already received the old wording, so the revision must
+            // survive that batch's ack and explicitly supersede it next time.
+            store.updateComment(key, tail, feedback, {
+              replacementId: uid("c"),
+              correctionOf: existing.feedback,
+            });
+            return json(res, 200, { delivery: "correction", page: pageState(key) });
+          }
+
+          store.updateComment(key, tail, feedback);
+          let updatedPending = false;
+          const target = store.page(key);
+          const targetName = target.kind === "url" ? target.url : target.file;
+          for (const [entryKey, record] of batches) {
+            if (record.delivered || !matchingCleanup(record)) continue;
+            const batchPage = record.batch.pages.find((page) => page.file === targetName || page.url === targetName);
+            const batchComment = batchPage?.comments.find((comment) => comment.id === tail);
+            if (!batchComment) continue;
+            batchComment.feedback = feedback;
+            store.setBatch(entryKey, record);
+            updatedPending = true;
+          }
+          return json(res, 200, { delivery: updatedPending ? "updated-pending" : "unsent", page: pageState(key) });
         }
 
         if (action === "edit" && req.method === "POST") {

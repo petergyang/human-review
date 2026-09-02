@@ -189,13 +189,21 @@ export class Store {
     });
   }
 
-  /** Rewording feedback before it is sent. Returns null for an unknown id. */
-  updateComment(key, id, feedback) {
+  /** Reword feedback, optionally turning a delivered instruction into a correction. */
+  updateComment(key, id, feedback, { replacementId = "", correctionOf = "" } = {}) {
     let found = false;
     const page = this.update(key, (p) => {
-      const comment = p.comments.find((c) => c.id === id);
+      const index = p.comments.findIndex((c) => c.id === id);
+      const comment = p.comments[index];
       if (comment) {
-        comment.feedback = feedback;
+        const updated = {
+          ...comment,
+          ...(replacementId ? { id: replacementId } : {}),
+          feedback,
+          updatedAt: Date.now(),
+          ...(correctionOf ? { correction: true, correctionOf } : {}),
+        };
+        p.comments[index] = updated;
         found = true;
       }
     });
