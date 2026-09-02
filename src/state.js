@@ -9,19 +9,95 @@ const PRUNE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const fresh = (entry, now) => !!entry && now - (entry.updatedAt || 0) < PRUNE_AGE_MS;
 
 /**
+ * Windows lets a virus scanner or indexer hold a brief handle on a file the
+ * moment it is created, and a rename against that handle fails with EPERM,
+ * EACCES or EBUSY. The handle is gone within a few milliseconds, so the write
+ * is not really lost -- it just has to be asked for again. Measured on a box
+ * running McAfee real-time protection, ~4% of renames failed on the first try
+ * and none survived a short backoff.
+ */
+const RETRYABLE_RENAME = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RENAME_TRIES = 5;
+
+/** Sleep without going async: atomicWrite is synchronous by contract. */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Drop the temp file after a failed write. The handle that blocked the rename
+ * blocks the unlink for exactly as long, so a single attempt would strand the
+ * file in the state directory -- and nothing else ever sweeps it. Give up
+ * quietly once the retries are spent: the caller is already throwing the error
+ * that matters, and a leftover temp file must not mask it.
+ */
+function discardTmp(tmp, unlink, sleep) {
+  try {
+    for (let attempt = 0; attempt < RENAME_TRIES; attempt++) {
+      try {
+        unlink(tmp);
+        return;
+      } catch (err) {
+        if (err.code === "ENOENT" || !RETRYABLE_RENAME.has(err.code)) return;
+        // Nothing waits on the last attempt: no attempt follows it.
+        if (attempt === RENAME_TRIES - 1) return;
+        sleep(2 ** attempt);
+      }
+    }
+  } catch {
+    // Best effort by definition. Whatever failed in here -- including the
+    // sleep -- must never escape and replace the write error the caller is
+    // already throwing.
+  }
+}
+
+/**
  * Atomic write via a unique sibling tmp file. The name is unguessable and the
  * create is exclusive, so a pre-planted symlink can never redirect the write,
  * and a failed rename never leaves a predictable orphan behind.
  */
 export function atomicWrite(file, data) {
+  return writeThroughTmp(file, data, REAL);
+}
+
+/**
+ * The real calls, looked up at call time rather than captured here, so a test
+ * can drive the exported atomicWrite through its retry by patching fs.
+ */
+const REAL = {
+  rename: (from, to) => fs.renameSync(from, to),
+  unlink: (target) => fs.unlinkSync(target),
+  sleep: (ms) => sleepSync(ms),
+};
+
+/**
+ * atomicWrite's body. Private: nothing outside this module may hand it a
+ * rename that quietly does nothing and reports a successful write. Tests
+ * reach the retry by patching fs, which REAL looks up at call time.
+ */
+function writeThroughTmp(file, data, overrides) {
+  // Merged per key, so a test can replace one call and still exercise the
+  // real implementations of the others.
+  const { rename, unlink, sleep } = { ...REAL, ...overrides };
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.human-review.tmp`;
   fs.writeFileSync(tmp, data, { flag: "wx" });
   try {
-    fs.renameSync(tmp, file);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        rename(tmp, file);
+        return;
+      } catch (err) {
+        if (attempt >= RENAME_TRIES - 1 || !RETRYABLE_RENAME.has(err.code)) throw err;
+        try {
+          sleep(2 ** attempt);
+        } catch {
+          // A broken sleeper is not the failure worth reporting.
+          throw err;
+        }
+      }
+    }
   } catch (err) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {}
+    discardTmp(tmp, unlink, sleep);
     throw err;
   }
 }
