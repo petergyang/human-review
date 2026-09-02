@@ -35,17 +35,21 @@ keeping its formatting syntax.
    npx -y human-review poll path/to/file.html
    ```
 
-   Start it **in the background** and end your turn (in Claude Code, run it
-   with `run_in_background: true`). The command exits only when the user
-   clicks Send or closes the review, and your harness wakes you when it does —
-   so there is nothing to re-run, no interval to poll on, and no `--timeout`
-   to add. One background poll per review is the whole wait. It survives the
-   local server restarting, and feedback is saved even if the poll dies, so
-   nothing is ever lost.
+   The command exits only when the user clicks Send or closes the review.
+   There is nothing to re-run, no interval to poll on, and no `--timeout` to
+   add. It survives the local server restarting, and feedback is saved even
+   if the poll dies, so nothing is ever lost. How you wait depends on your
+   harness:
 
-   Only if your harness cannot wake you when a background command exits, run
-   the same command in the foreground instead and keep waiting on it (or on
-   the process handle it returns) until it exits.
+   - **Claude Code:** run it with `run_in_background: true` and end your turn.
+     Claude Code wakes you with the output the moment the command exits.
+   - **Codex, Cursor, and everything else:** run it in the **foreground** and
+     stay on it until it exits. Do not detach it or start it as a background
+     session — nothing will wake you when a detached command finishes, and
+     the user's Send will sit unread until they nudge you. If your shell tool
+     enforces a maximum command duration, pass `--timeout` a little under
+     that limit and run the same command again when it prints
+     `{"status":"timeout"}`.
 
    If it prints `{"status":"closed"}`, the review is over: the user ended it,
    closed the tab, or never had one open (`reason` says which). Stop and do

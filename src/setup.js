@@ -64,20 +64,20 @@ const CODEX_BLOCK = `
 After writing an HTML or Markdown file the user will read, open it for them with
 \`npx -y human-review <file.html>\`. For a locally running web page, open the real
 route with \`npx -y human-review http://localhost:3000/path\` instead of recreating
-it as a static file. Then start
-\`npx -y human-review poll <target>\` in the background and end the turn: it
+it as a static file. Then run
+\`npx -y human-review poll <target>\` in the foreground and stay on it: it
 blocks until the user hits Send, prints the \`{"status":"feedback"}\` batch,
-and exits, which wakes you. Do not add \`--timeout\` and do not poll on an
-interval. Apply the batch, then start the next background poll with \`--ack\`.
+and exits. Do not detach it or start it as a background session — nothing
+wakes you when a detached command finishes, so the user's Send would sit
+unread. Do not poll on an interval. If your shell tool enforces a maximum
+command duration, pass \`--timeout\` a little under that limit and run the
+same command again on \`{"status":"timeout"}\`. Apply the batch, then run
+the poll again with \`--ack\`.
 \`{"status":"closed"}\` means the review is over (ended, tab closed, or none
 open); do not poll again, and if its \`unsent\` counts are not zero, tell the user
 in one line. \`{"status":"superseded"}\` means a newer poll of yours owns the
-wait; stop this one silently.
-
-Only if your harness cannot wake you when a background command exits, keep the
-poll in the foreground (or wait on the process handle it returns) until it
-exits. \`npx -y human-review status <target>\` reports instantly whether
-feedback is already waiting, without blocking.
+wait; stop this one silently. \`npx -y human-review status <target>\` reports
+instantly whether feedback is already waiting, without blocking.
 
 The batch groups feedback by page under \`pages\`, so fix every page listed. Items
 under \`edits\` are changes the user already made: \`after\` is their exact wording,
