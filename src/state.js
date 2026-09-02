@@ -107,8 +107,8 @@ function writeThroughTmp(file, data, overrides) {
  *
  * Shape:
  *   {
- *     pages:   { <key>: { key, file, pristine, comments[], edits[], updatedAt } },
- *     batches: { <entryKey>: { batch, cleanup, updatedAt } },
+ *     pages:   { <key>: { key, file, pristine, dynamic, comments[], edits[], updatedAt } },
+ *     batches: { <entryKey>: { batch, cleanup, delivered, priorCleanup, updatedAt } },
  *   }
  *
  * Pages are fully independent: no page ever references another. Batches are
@@ -265,17 +265,51 @@ export class Store {
     });
   }
 
-  /** Rewording feedback before it is sent. Returns null for an unknown id. */
-  updateComment(key, id, feedback) {
+  /**
+   * Reword feedback. A comment the agent already received keeps the old id in
+   * that batch's cleanup, so the reworded one takes a fresh id (`newId`) and
+   * survives the ack to ship with the next Send. Returns null for an unknown id.
+   */
+  updateComment(key, id, feedback, { newId = "" } = {}) {
     let found = false;
     const page = this.update(key, (p) => {
       const comment = p.comments.find((c) => c.id === id);
       if (comment) {
         comment.feedback = feedback;
+        comment.updatedAt = Date.now();
+        if (newId) comment.id = newId;
         found = true;
       }
     });
     return found ? page : null;
+  }
+
+  /** Undo of a delete or move: the row for that block no longer describes anything. */
+  removeEdit(key, label, kind) {
+    return this.update(key, (page) => {
+      page.edits = page.edits.filter((e) => !(e.label === label && e.kind === kind));
+    });
+  }
+
+  /** The user abandoned leftover feedback from an earlier review of this page. */
+  discardFeedback(key) {
+    return this.update(key, (page) => {
+      page.comments = [];
+      page.edits = [];
+    });
+  }
+
+  /**
+   * A self-rendering HTML file: its scripts rewrite the DOM, so browser edits
+   * are feedback only and never on disk. Remembered so the batch can say so.
+   */
+  setDynamic(key, dynamic) {
+    const page = this.page(key);
+    if (!page || !!page.dynamic === !!dynamic) return page;
+    return this.update(key, (p) => {
+      if (dynamic) p.dynamic = true;
+      else delete p.dynamic;
+    });
   }
 
   /**
@@ -309,11 +343,16 @@ export class Store {
     });
   }
 
-  /** After the agent writes, its version becomes the new revert target. */
-  setPristine(key, html) {
+  /**
+   * After the agent writes, its version becomes the new revert target. Edit
+   * rows are dropped only when they were already written into the file: on a
+   * Markdown or self-rendering page they are unsent feedback, and an external
+   * write (an editor autosave, a formatter) must not throw them away.
+   */
+  setPristine(key, html, { keepEdits = false } = {}) {
     return this.update(key, (page) => {
       page.pristine = html;
-      page.edits = [];
+      if (!keepEdits) page.edits = [];
     });
   }
 
@@ -342,10 +381,44 @@ export class Store {
     return this.data.batches;
   }
 
-  setBatch(entryKey, { batch, cleanup }) {
+  setBatch(entryKey, { batch, cleanup, delivered = false, priorCleanup = null }) {
     this.clearedBatches.delete(entryKey);
-    this.data.batches[entryKey] = { batch, cleanup, updatedAt: Date.now() };
+    this.data.batches[entryKey] = {
+      batch,
+      cleanup,
+      delivered: !!delivered,
+      ...(priorCleanup && priorCleanup.length ? { priorCleanup } : {}),
+      updatedAt: Date.now(),
+    };
     this.save();
+  }
+
+  /**
+   * Delivery is durable: a server replaced between handing a batch out and
+   * the agent's --ack must still honor that ack, not ship the batch twice.
+   */
+  markDelivered(entryKey) {
+    const record = this.data.batches[entryKey];
+    if (!record || record.delivered) return;
+    record.delivered = true;
+    record.updatedAt = Date.now();
+    this.save();
+  }
+
+  /**
+   * A batch another server process wrote (two servers briefly overlapping)
+   * lives only on disk. Read it fresh so a poll here can still deliver it.
+   */
+  batchFromDisk(entryKey) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(statePath(), "utf8"));
+      const record = parsed && parsed.batches ? parsed.batches[entryKey] : null;
+      if (!record || this.clearedBatches.has(entryKey)) return null;
+      this.data.batches[entryKey] = record;
+      return record;
+    } catch {
+      return null;
+    }
   }
 
   clearBatch(entryKey) {
