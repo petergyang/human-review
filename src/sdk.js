@@ -364,6 +364,18 @@ const clip = (text, limit = 40) => {
  */
 const pinnedLabels = new WeakMap();
 
+/**
+ * Sibling order as the page loaded. Ordinals in labels ("p 3") come from
+ * here, so deleting a paragraph does not renumber the ones after it and hand
+ * two different blocks the same label within one review.
+ */
+const bootChildren = new WeakMap();
+function snapshotOrder() {
+  for (const el of document.body.querySelectorAll("*")) {
+    if (el.children.length > 1 && !isOurs(el)) bootChildren.set(el, [...el.children]);
+  }
+}
+
 /** The block a hover/edit belongs to, plus a human label for the edit list. */
 function targetFor(node) {
   const el = node && node.nodeType === 1 ? node : node && node.parentElement;
@@ -387,8 +399,12 @@ function targetFor(node) {
     const heading = /^h[1-6]$/i.test(block.tagName) ? "" : precedingHeading(block);
     const tag = block.tagName.toLowerCase();
     // Siblings of the same tag would otherwise share a label and collapse into
-    // one edit row, so number them.
-    const twins = block.parentElement ? [...block.parentElement.children].filter((c) => c.tagName === block.tagName) : [];
+    // one edit row, so number them — by their order at load, not right now.
+    const parent = block.parentElement;
+    const live = parent ? [...parent.children] : [];
+    const booted = parent ? bootChildren.get(parent) : null;
+    const siblings = booted && booted.includes(block) ? booted : live;
+    const twins = siblings.filter((c) => c.tagName === block.tagName);
     const ordinal = twins.length > 1 ? ` ${twins.indexOf(block) + 1}` : "";
     pinnedLabels.set(block, heading ? `${clip(heading, 26)} · ${tag}${ordinal}` : clip(block.textContent, 40) || tag);
   }
@@ -720,6 +736,7 @@ function boot() {
   // real app stays directly editable, not just its initial HTML response.
   keepBodyEditable(document.body);
   document.body.spellcheck = false;
+  snapshotOrder();
   baseline = serialize();
   bootSnapshot = baseline;
   watchSelfRendering();
@@ -918,12 +935,16 @@ function boot() {
    * "this paragraph became a list" instead of a row for an unknown block with
    * no `before`.
    */
-  const adoptIdentity = (from, to) => {
-    if (!from || !to || from === to) return;
-    if (!pinnedLabels.has(to) && pinnedLabels.has(from)) pinnedLabels.set(to, pinnedLabels.get(from));
-    if (!originalText.has(to) && originalText.has(from)) {
-      originalText.set(to, originalText.get(from));
-      originalHtml.set(to, originalHtml.get(from));
+  const adoptIdentity = (source, created) => {
+    if (!source || !created || created === source.el) return;
+    // The input event fired inside execCommand, before this ran, and the
+    // fresh element named itself ("li 3", no `before`). Retract that row.
+    const stale = pinnedLabels.get(created);
+    if (stale && stale !== source.label) editQueue.delete(`${stale}\u0000edited`);
+    pinnedLabels.set(created, source.label);
+    if (!originalText.has(created) && originalText.has(source.el)) {
+      originalText.set(created, originalText.get(source.el));
+      originalHtml.set(created, originalHtml.get(source.el));
     }
   };
 
@@ -935,8 +956,9 @@ function boot() {
     const el = node && (node.nodeType === 1 ? node : node.parentElement);
     const item = el && el.closest ? el.closest("li") : null;
     const list = item ? item.closest("ul, ol") : null;
-    adoptIdentity(source.el, item);
-    adoptIdentity(source.el, list);
+    adoptIdentity(source, item);
+    adoptIdentity(source, list);
+    if (item) emitBlockEdit(item, source.label);
   };
 
   /**

@@ -823,8 +823,12 @@ $("leftoverDiscard").addEventListener("click", async () => {
   }
 });
 
+/** Once the review is over or the tab is leaving, nothing may open a new session. */
+let finished = false;
+
 /** The session is over: freeze the page and say so. Feedback is already safe. */
 function showEnded(message) {
+  finished = true;
   if (document.querySelector(".ended")) return;
   if (events) events.close();
   clearTimeout(retryTimer);
@@ -842,6 +846,8 @@ function showEnded(message) {
 // reload). keepalive lets the request outlive the page; sendBeacon cannot
 // carry the token header.
 window.addEventListener("pagehide", () => {
+  finished = true;
+  if (events) events.close();
   try {
     fetch(`/api/session/${state.sessionId}/away`, {
       method: "POST",
@@ -981,9 +987,10 @@ function connect() {
   source.onerror = () => {
     // A dropped connection reconnects on its own. A refused one (the server
     // forgot this session) never will, so open a fresh session instead.
-    if (source.readyState !== EventSource.CLOSED) return;
+    if (source.readyState !== EventSource.CLOSED || finished) return;
     source.close();
     rebootstrap().then((ok) => {
+      if (finished) return;
       if (ok) connect();
       else showEnded("This review session expired. Run human-review on this page again to reopen it.");
     });

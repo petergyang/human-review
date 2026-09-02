@@ -48,6 +48,8 @@ Review a page running on localhost:
 
 Human Review opens the file in your browser. Make direct edits, leave comments, and click Send. Your agent receives all your feedback in one batch, updates the source, and refreshes the page for another review.
 
+The agent waits with a single background command that exits the moment you hit Send — no polling on a timer. Closing the tab, or clicking End review, releases the agent too. Feedback you never sent is kept, and the next time you open that page you can restore or discard it.
+
 Note: For HTML files, direct edits and resizes save automatically. For Markdown and localhost pages, click Send so your agent can apply them to the source.
 
 ## What this skill lets you do
@@ -60,7 +62,8 @@ Note: For HTML files, direct edits and resizes save automatically. For Markdown 
 - **Paste images** from your clipboard — file reviews save them beside the document; localhost reviews stage them for the agent to place in the app source.
 - **Select a phrase and leave a comment** anchored to the exact text.
 - **Comment on an image, chart, or section** by clicking the element.
-- **Remove elements** without explaining the deletion in chat.
+- **Remove elements** without explaining the deletion in chat. Deletes and moves come with an Undo.
+- **Edit a comment** after writing it, even one already sent — a reworded comment reaches the agent with the next Send.
 - **Command-click links** to review multiple pages without losing your feedback.
 - **Send every edit and comment at once** instead of writing a long chat message.
 

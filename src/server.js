@@ -41,6 +41,8 @@ const IDLE_SHUTDOWN_MS = Number(process.env.HUMAN_REVIEW_IDLE_MS || 45 * 60 * 10
 const SESSION_TTL_MS = 30 * 60 * 1000;
 /** After a tab says it is going away, how long a reload has to come back. */
 const CLOSE_GRACE_MS = Number(process.env.HUMAN_REVIEW_CLOSE_GRACE_MS || 5000);
+/** A session no tab ever connected to (the browser never opened) is dropped after this long. */
+const NEVER_OPENED_MS = Number(process.env.HUMAN_REVIEW_NEVER_OPENED_MS || 60 * 1000);
 /** A poll with no review open waits this long for one before giving up. */
 const NO_REVIEW_GRACE_MS = Number(process.env.HUMAN_REVIEW_NO_REVIEW_GRACE_MS || 10000);
 /** Edit text is capped so one pasted novel cannot bloat the state file; the cut is marked. */
@@ -749,6 +751,8 @@ export function createServer() {
           visited: new Set([page.key]),
           clients: new Set(),
           lastSeen: Date.now(),
+          createdAt: Date.now(),
+          everConnected: false,
           leftover,
           awayTimer: null,
         });
@@ -1170,6 +1174,7 @@ export function createServer() {
         // The tab that said it was leaving came back (a reload).
         clearTimeout(session.awayTimer);
         session.awayTimer = null;
+        session.everConnected = true;
         session.clients.add(res);
         seen(session);
         emit(session, "agent", { state: agentState(session.entryKey) });
@@ -1247,6 +1252,8 @@ export function createServer() {
     // laptop that never woke — so the review ends and any waiting agent is freed.
     for (const session of [...sessions.values()]) {
       if (session.clients.size === 0 && now - session.lastSeen > SESSION_TTL_MS) endSession(session, "window_closed");
+      // Opened by the CLI but no browser ever showed up: nothing to wait for.
+      else if (!session.everConnected && session.clients.size === 0 && now - (session.createdAt || 0) > NEVER_OPENED_MS) endSession(session, "window_closed");
     }
 
     // Stop watching files no remaining session can see.
