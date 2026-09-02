@@ -28,32 +28,40 @@ keeping its formatting syntax.
    npx -y human-review http://localhost:3000/wiki
    ```
 
-3. Wait for feedback. This blocks until they hit Send, or the timeout passes:
+3. Wait for feedback. This command blocks until the user hits Send in the
+   browser, then prints their batch and exits:
 
    ```sh
-   npx -y human-review poll path/to/file.html --timeout 600
+   npx -y human-review poll path/to/file.html
    ```
 
-   Keep this command in the foreground. Do not end your turn while it is waiting.
-   If your shell returns a process or session handle, keep waiting on that handle
-   until the command exits. If it prints `{"status":"timeout"}`, no feedback has
-   arrived yet — run the same poll command again to keep waiting. Feedback is
-   saved even if a poll dies, so nothing is ever lost.
+   Start it **in the background** and end your turn (in Claude Code, run it
+   with `run_in_background: true`). The command exits only when the user
+   clicks Send or closes the review, and your harness wakes you when it does —
+   so there is nothing to re-run, no interval to poll on, and no `--timeout`
+   to add. One background poll per review is the whole wait. It survives the
+   local server restarting, and feedback is saved even if the poll dies, so
+   nothing is ever lost.
+
+   Only if your harness cannot wake you when a background command exits, run
+   the same command in the foreground instead and keep waiting on it (or on
+   the process handle it returns) until it exits.
 
    If it prints `{"status":"closed"}`, the user ended the review from the
-   browser — stop polling and do not run the poll command again. Unsent
-   feedback is kept and ships the next time this target is reviewed.
+   browser — stop and do not start another poll. Unsent feedback is kept and
+   ships the next time this target is reviewed.
 
-4. Apply what comes back, then wait again. `--ack` clears the batch you just handled:
+4. Apply what comes back, then start the next background poll. `--ack` clears
+   the batch you just handled:
 
    ```sh
-   npx -y human-review poll path/to/file.html --ack --timeout 600
+   npx -y human-review poll path/to/file.html --ack
    ```
 
 Repeat 3–4 until the user says they are done.
 
-Not sure whether feedback is already waiting — say, at the start of a new turn?
-This answers instantly without blocking:
+Not sure whether feedback is already waiting — say, at the start of a new turn
+with no poll running? This answers instantly without blocking:
 
 ```sh
 npx -y human-review status path/to/file.html

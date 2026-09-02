@@ -145,6 +145,49 @@ test("a restarted server still delivers the sent batch", async () => {
   }
 });
 
+test("an open-ended poll reconnects when the server is replaced underneath it", async () => {
+  const third = spawnServer();
+  let fourth = null;
+  try {
+    const thirdRecord = await waitForServer(server.pid);
+    // A fresh server reloads the old batch as undelivered, so deliver it once
+    // here; then the CLI's --ack clears it and the poll blocks.
+    await request(thirdRecord, "GET", `/api/poll?target=${encodeURIComponent(file)}`);
+    // No --timeout: this is the wait an agent parks in the background.
+    const poll = cli("poll", file, "--ack");
+    let stderr = "";
+    poll.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    for (let i = 0; i < 200 && !stderr.includes("Waiting for feedback"); i += 1) await new Promise((r) => setTimeout(r, 25));
+    await new Promise((r) => setTimeout(r, 300));
+
+    await stop(third);
+    fs.rmSync(path.join(process.env.HUMAN_REVIEW_STATE_DIR, "server.json"), { force: true });
+    fourth = spawnServer();
+    const record = await waitForServer(thirdRecord.pid);
+    assert.equal(poll.exitCode, null, `poll exited early: ${stderr}`);
+
+    const opened = await request(record, "POST", "/api/session", { file });
+    await request(record, "POST", `/api/page/${opened.body.key}/comment`, {
+      kind: "selection",
+      quote: "Original",
+      feedback: "Still here after the restart.",
+    });
+    await request(record, "POST", `/api/page/${opened.body.key}/send`, { sessionId: opened.body.sessionId, note: "" });
+
+    const result = await collect(poll);
+    assert.equal(result.code, 0, result.stderr);
+    const batch = JSON.parse(result.stdout);
+    assert.equal(batch.status, "feedback");
+    assert.equal(batch.pages[0].comments[0].feedback, "Still here after the restart.");
+    assert.match(stderr + result.stderr, /reconnecting/);
+  } finally {
+    await stop(third);
+    if (fourth) await stop(fourth);
+  }
+});
+
 test.after(async () => {
   await stop(first);
   fs.rmSync(tmp, { recursive: true, force: true });
