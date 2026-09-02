@@ -43,6 +43,13 @@ const MAX_LOCAL_REDIRECTS = 5;
 /** Generous enough for a dev server's cold compile, but a wedged one can't hang us forever. */
 const LOCAL_FETCH_TIMEOUT_MS = 30000;
 const MAX_LOCAL_PAGE_BYTES = 24 * 1024 * 1024;
+/** What a poll gets once the human has ended the review. One wording, two delivery paths. */
+const SESSION_CLOSED = {
+  status: "closed",
+  next_step:
+    "The user ended this review session. Stop polling — do not run the poll command again. " +
+    "Any unsent feedback is kept and will ship the next time this target is reviewed.",
+};
 
 const hash = (text) => crypto.createHash("sha1").update(text).digest("hex");
 const uid = (prefix) => `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
@@ -390,19 +397,17 @@ export function createServer() {
     session.clients.clear();
     // Another window on the same target keeps its agent connection alive.
     if (sessionsForEntry(session.entryKey).length > 0) return;
+    // Leave a mark for a poll that has not started yet. Draining the pollers below
+    // only reaches agents already waiting, and the documented loop is apply-then-poll,
+    // so the poll that follows a delivered batch usually arrives after this point.
+    store.markEnded(session.entryKey);
     const set = pollers.get(session.entryKey);
     if (!set) return;
     for (const poller of [...set]) {
       clearInterval(poller.timer);
       set.delete(poller);
-      poller.res.end(
-        JSON.stringify({
-          status: "closed",
-          next_step:
-            "The user ended this review session. Stop polling — do not run the poll command again. " +
-            "Any unsent feedback is kept and will ship the next time this target is reviewed.",
-        })
-      );
+      store.takeEnded(session.entryKey);
+      poller.res.end(JSON.stringify(SESSION_CLOSED));
     }
   }
 
@@ -940,6 +945,9 @@ export function createServer() {
           broadcastAgent(entryKey);
           return json(res, 200, pending.batch);
         }
+
+        // Feedback first: an end mark must never hide a batch the human already sent.
+        if (store.takeEnded(entryKey)) return json(res, 200, SESSION_CLOSED);
 
         res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         res.write(" ");

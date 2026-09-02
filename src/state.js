@@ -33,6 +33,7 @@ export function atomicWrite(file, data) {
  *   {
  *     pages:   { <key>: { key, file, pristine, comments[], edits[], updatedAt } },
  *     batches: { <entryKey>: { batch, cleanup, updatedAt } },
+ *     ended:   { <entryKey>: { updatedAt } },
  *   }
  *
  * Pages are fully independent: no page ever references another. Batches are
@@ -41,9 +42,11 @@ export function atomicWrite(file, data) {
  */
 export class Store {
   constructor() {
-    this.data = { pages: {}, batches: {} };
+    this.data = { pages: {}, batches: {}, ended: {} };
     /** Batches this process acked; save() must not resurrect them from disk. */
     this.clearedBatches = new Set();
+    /** End marks this process handed to a poller; same reason. */
+    this.clearedEnded = new Set();
     this.load();
   }
 
@@ -52,7 +55,7 @@ export class Store {
       const raw = fs.readFileSync(statePath(), "utf8");
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && parsed.pages) {
-        this.data = { pages: parsed.pages, batches: parsed.batches || {} };
+        this.data = { pages: parsed.pages, batches: parsed.batches || {}, ended: parsed.ended || {} };
       }
     } catch {
       // Missing or unreadable state is not an error; start empty.
@@ -74,6 +77,9 @@ export class Store {
     for (const [key, batch] of Object.entries(this.data.batches)) {
       if (!fresh(batch, now)) delete this.data.batches[key];
     }
+    for (const [key, mark] of Object.entries(this.data.ended)) {
+      if (!fresh(mark, now)) delete this.data.ended[key];
+    }
   }
 
   /**
@@ -84,18 +90,20 @@ export class Store {
   save() {
     ensureStateDir();
     const target = statePath();
-    let onDisk = { pages: {}, batches: {} };
+    let onDisk = { pages: {}, batches: {}, ended: {} };
     try {
       const parsed = JSON.parse(fs.readFileSync(target, "utf8"));
-      if (parsed && parsed.pages) onDisk = { pages: parsed.pages, batches: parsed.batches || {} };
+      if (parsed && parsed.pages) onDisk = { pages: parsed.pages, batches: parsed.batches || {}, ended: parsed.ended || {} };
     } catch {
       // No readable state yet; ours becomes the file.
     }
     const merged = {
       pages: { ...onDisk.pages, ...this.data.pages },
       batches: { ...onDisk.batches, ...this.data.batches },
+      ended: { ...onDisk.ended, ...this.data.ended },
     };
     for (const key of this.clearedBatches) delete merged.batches[key];
+    for (const key of this.clearedEnded) delete merged.ended[key];
     // Age-prune the merged result too, so the file cannot grow without bound.
     const now = Date.now();
     for (const [key, page] of Object.entries(merged.pages)) {
@@ -104,7 +112,38 @@ export class Store {
     for (const [key, batch] of Object.entries(merged.batches)) {
       if (!fresh(batch, now)) delete merged.batches[key];
     }
+    for (const [key, mark] of Object.entries(merged.ended)) {
+      if (!fresh(mark, now)) delete merged.ended[key];
+    }
     atomicWrite(target, JSON.stringify(merged, null, 2));
+  }
+
+  /**
+   * Remember that the human ended the review, for a poll that has not started yet.
+   * endSession can only hand `closed` to pollers already waiting, so an agent that
+   * applies a batch and then polls again — the loop SKILL.md prescribes — would
+   * otherwise register on a target nothing will ever close and burn its whole timeout.
+   */
+  markEnded(entryKey) {
+    this.clearedEnded.delete(entryKey);
+    this.data.ended[entryKey] = { updatedAt: Date.now() };
+    this.save();
+  }
+
+  /** Consume the end mark. True once per ended session, then false until the next one. */
+  takeEnded(entryKey) {
+    if (!this.data.ended[entryKey]) return false;
+    delete this.data.ended[entryKey];
+    this.clearedEnded.add(entryKey);
+    this.save();
+    return true;
+  }
+
+  /** A target being opened again is a live review, so any end mark is stale. */
+  clearEnded(entryKey) {
+    if (!this.data.ended[entryKey]) return;
+    delete this.data.ended[entryKey];
+    this.clearedEnded.add(entryKey);
   }
 
   /** Register a file as a reviewable page, capturing the agent's version. */
@@ -128,6 +167,7 @@ export class Store {
     }
     page.updatedAt = Date.now();
     this.data.pages[key] = page;
+    this.clearEnded(key);
     this.save();
     return page;
   }
@@ -152,6 +192,7 @@ export class Store {
     delete page.file;
     page.updatedAt = Date.now();
     this.data.pages[key] = page;
+    this.clearEnded(key);
     this.save();
     return page;
   }
