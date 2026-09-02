@@ -9,6 +9,14 @@ import { pageUrl, replacePage } from "./chrome-session.js";
 import { normalizeHref } from "./editing.js";
 import { framePolicy } from "./frame-policy.js";
 
+/**
+ * True when an "Enter" keydown is really an IME confirming its composition
+ * (e.g. finalizing kanji conversion), not the user asking to submit.
+ */
+function isImeCommitEnter(event) {
+  return Boolean(event.isComposing || event.keyCode === 229);
+}
+
 const $ = (id) => document.getElementById(id);
 const frame = $("frame");
 
@@ -393,6 +401,7 @@ function editComment(card, body, comment) {
   input.addEventListener("keydown", (event) => {
     event.stopPropagation();
     if (event.key === "Enter" && !event.shiftKey) {
+      if (isImeCommitEnter(event)) return;
       event.preventDefault();
       commit();
     }
@@ -647,6 +656,7 @@ $("compose").addEventListener("mousedown", (event) => {
 
 $("composeText").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
+    if (isImeCommitEnter(event)) return;
     event.preventDefault();
     commitCompose();
   }
@@ -771,6 +781,7 @@ function applyTheme(dark) {
 document.addEventListener("keydown", (event) => {
   const meta = event.metaKey || event.ctrlKey;
   if (meta && event.key === "Enter") {
+    if (isImeCommitEnter(event)) return;
     event.preventDefault();
     if (!$("send").disabled) $("send").click();
     return;
