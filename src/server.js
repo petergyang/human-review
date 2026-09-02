@@ -84,7 +84,11 @@ async function fetchLocalPage(target, redirects = 0) {
     const location = response.headers.get("location");
     if (!location) throw new Error(`Localhost returned redirect ${response.status} without a location.`);
     if (redirects >= MAX_LOCAL_REDIRECTS) throw new Error("Too many redirects while loading the localhost page.");
-    return fetchLocalPage(new URL(location, url).href, redirects + 1);
+    const redirectUrl = new URL(location, url);
+    if (redirectUrl.hostname !== "localhost" && redirectUrl.hostname !== "127.0.0.1") {
+      throw new Error(`Redirect target must be localhost, got: ${redirectUrl.hostname}`);
+    }
+    return fetchLocalPage(redirectUrl.href, redirects + 1);
   }
   if (!response.ok) throw new Error(`Localhost returned ${response.status} for ${url}`);
   const contentType = response.headers.get("content-type") || "";
