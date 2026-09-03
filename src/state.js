@@ -1,7 +1,30 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalTarget, ensureStateDir, pageKey, realFile, statePath, targetKey } from "./paths.js";
+import { canonicalTarget, ensureStateDir, pageKey, realFile, stateDir, statePath, targetKey } from "./paths.js";
+
+/**
+ * The agent's copy of each page is the revert target. It is whole documents,
+ * so it lives in its own file per page rather than inside state.json, which
+ * every edit flush rewrites in full.
+ */
+const pristineDir = () => path.join(stateDir(), "pristine");
+const pristinePath = (key) => path.join(pristineDir(), `${key}.html`);
+const digest = (text) => crypto.createHash("sha1").update(text).digest("hex");
+
+function readPristine(key) {
+  try {
+    return fs.readFileSync(pristinePath(key), "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function dropPristine(key) {
+  try {
+    fs.unlinkSync(pristinePath(key));
+  } catch {}
+}
 
 /** Anything untouched this long is review debris, not work in progress. */
 const PRUNE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -120,6 +143,8 @@ export class Store {
     this.data = { pages: {}, batches: {} };
     /** Batches this process acked; save() must not resurrect them from disk. */
     this.clearedBatches = new Set();
+    /** Digest of the pristine copy already on disk per page; unchanged copies are not rewritten. */
+    this.pristineWritten = new Map();
     this.load();
   }
 
@@ -133,6 +158,13 @@ export class Store {
     } catch {
       // Missing or unreadable state is not an error; start empty.
     }
+    for (const [key, page] of Object.entries(this.data.pages)) {
+      // A state file from before pristine copies moved out still embeds
+      // them; that copy is kept and lands in its own file on the next save.
+      if (typeof page.pristine === "string") continue;
+      page.pristine = readPristine(key);
+      if (page.pristine) this.pristineWritten.set(key, digest(page.pristine));
+    }
     this.prune();
     return this.data;
   }
@@ -145,6 +177,7 @@ export class Store {
       if (!fresh(page, now) || missingFile) {
         delete this.data.pages[key];
         delete this.data.batches[key];
+        dropPristine(key);
       }
     }
     for (const [key, batch] of Object.entries(this.data.batches)) {
@@ -167,15 +200,29 @@ export class Store {
     } catch {
       // No readable state yet; ours becomes the file.
     }
+    const stripped = {};
+    for (const [key, page] of Object.entries(this.data.pages)) {
+      const { pristine, ...rest } = page;
+      stripped[key] = rest;
+      if (typeof pristine !== "string" || !pristine) continue;
+      const hash = digest(pristine);
+      if (this.pristineWritten.get(key) === hash) continue;
+      fs.mkdirSync(pristineDir(), { recursive: true });
+      atomicWrite(pristinePath(key), pristine);
+      this.pristineWritten.set(key, hash);
+    }
     const merged = {
-      pages: { ...onDisk.pages, ...this.data.pages },
+      pages: { ...onDisk.pages, ...stripped },
       batches: { ...onDisk.batches, ...this.data.batches },
     };
     for (const key of this.clearedBatches) delete merged.batches[key];
     // Age-prune the merged result too, so the file cannot grow without bound.
     const now = Date.now();
     for (const [key, page] of Object.entries(merged.pages)) {
-      if (!fresh(page, now)) delete merged.pages[key];
+      if (!fresh(page, now)) {
+        delete merged.pages[key];
+        dropPristine(key);
+      }
     }
     for (const [key, batch] of Object.entries(merged.batches)) {
       if (!fresh(batch, now)) delete merged.batches[key];

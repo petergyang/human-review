@@ -25,6 +25,36 @@ test("openPage records the agent's version as the revert target", () => {
   assert.equal(store.pageForFile(file).key, opened.key);
 });
 
+test("the pristine copy lives in its own file, not in state.json, and a legacy inline copy migrates", () => {
+  const store = new Store();
+  const file = page("pristine.html", "<h1>big</h1>");
+  const big = `<h1>big</h1>${"<p>filler</p>".repeat(500)}`;
+  const { key } = store.openPage(file, big);
+  const stateFile = path.join(process.env.HUMAN_REVIEW_STATE_DIR, "state.json");
+  const raw = fs.readFileSync(stateFile, "utf8");
+  assert.doesNotMatch(raw, /filler/, "state.json no longer embeds whole documents");
+  const copy = path.join(process.env.HUMAN_REVIEW_STATE_DIR, "pristine", `${key}.html`);
+  assert.equal(fs.readFileSync(copy, "utf8"), big);
+  assert.equal(new Store().page(key).pristine, big, "a fresh store reads the copy back");
+
+  // An unchanged copy is not rewritten on every save.
+  const before = fs.statSync(copy).mtimeMs;
+  store.addComment(key, { id: "c1", kind: "selection", quote: "big", feedback: "x" });
+  assert.equal(fs.statSync(copy).mtimeMs, before);
+  store.setPristine(key, "<h1>v2</h1>");
+  assert.equal(fs.readFileSync(copy, "utf8"), "<h1>v2</h1>");
+
+  // A state.json written before this change still carries pristine inline.
+  const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  parsed.pages[key].pristine = "<h1>inline</h1>";
+  fs.writeFileSync(stateFile, JSON.stringify(parsed));
+  const legacy = new Store();
+  assert.equal(legacy.page(key).pristine, "<h1>inline</h1>");
+  legacy.addComment(key, { id: "c2", kind: "selection", quote: "big", feedback: "y" });
+  assert.doesNotMatch(fs.readFileSync(stateFile, "utf8"), /inline/, "the next save moves it out");
+  assert.equal(fs.readFileSync(copy, "utf8"), "<h1>inline</h1>");
+});
+
 test("reopening a page keeps its comments", () => {
   const store = new Store();
   const file = page("b.html", "<h1>v1</h1>");
