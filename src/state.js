@@ -331,6 +331,15 @@ export class Store {
     return found ? page : null;
   }
 
+  /** What human-review itself last wrote to the file, so a later open can tell the user's autosave from someone else's write. */
+  setSavedHash(key, savedHash) {
+    const page = this.page(key);
+    if (!page || page.savedHash === savedHash) return page;
+    return this.update(key, (p) => {
+      p.savedHash = savedHash;
+    });
+  }
+
   /** Undo of a delete or move: the row for that block no longer describes anything. */
   removeEdit(key, label, kind) {
     return this.update(key, (page) => {
