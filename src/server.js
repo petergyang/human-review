@@ -312,7 +312,23 @@ export function createServer() {
     const clean = stripSdk(html);
     atomicWrite(page.file, clean);
     lastWritten.set(key, hash(clean));
+    store.setSavedHash(key, hash(clean));
     return clean;
+  }
+
+  /**
+   * Register a file for review. The file as it sits on disk becomes the
+   * agent's version — the revert target — unless the page still carries
+   * unsent edits and the file is exactly what the browser last autosaved:
+   * then the disk copy *is* those edits, and the agent's version stays.
+   */
+  function openFile(file) {
+    const html = stripSdk(fs.readFileSync(file, "utf8"));
+    const existing = store.pageForFile(file);
+    const keep = !!existing && existing.kind !== "url" && existing.edits.length > 0 && existing.savedHash === hash(html);
+    const page = store.openPage(file, keep ? undefined : html);
+    lastWritten.set(page.key, hash(html));
+    return page;
   }
 
   // ------------------------------------------------------------------ batch
@@ -735,9 +751,7 @@ export function createServer() {
           page = store.openUrl(target.value);
         } else {
           if (!fs.existsSync(target.value)) return json(res, 404, { error: `File not found: ${target.value}` });
-          const html = fs.readFileSync(target.value, "utf8");
-          page = store.openPage(target.value, stripSdk(html));
-          lastWritten.set(page.key, hash(stripSdk(html)));
+          page = openFile(target.value);
         }
         watchPage(page.key);
         const id = uid("s");
@@ -994,9 +1008,14 @@ export function createServer() {
 
         // Leftover feedback from an earlier review the user chose not to keep.
         if (action === "discard" && req.method === "POST") {
+          const page = store.page(key);
+          // On a plain HTML file the edits were autosaved into it; discarding
+          // them means putting the agent's version back, not just dropping rows.
+          const reverted = page.kind !== "url" && !isMarkdown(page.file) && !page.dynamic && !!page.pristine;
+          if (reverted) writePage(key, page.pristine);
           store.discardFeedback(key);
-          for (const session of sessionsForKey(key)) emit(session, "refresh", {});
-          return json(res, 200, { page: pageState(key) });
+          for (const session of sessionsForKey(key)) emit(session, reverted ? "reload" : "refresh", reverted ? { key } : {});
+          return json(res, 200, { page: pageState(key), reverted });
         }
 
         // File reviews keep pasted images beside the document. Localhost
@@ -1149,9 +1168,7 @@ export function createServer() {
         if (!targetFile || !fs.existsSync(targetFile) || !/\.(x?html?|md|markdown)$/i.test(targetFile)) {
           return json(res, 400, { error: "not a local html or markdown page" });
         }
-        const html = fs.readFileSync(targetFile, "utf8");
-        const page = store.openPage(targetFile, stripSdk(html));
-        lastWritten.set(page.key, hash(stripSdk(html)));
+        const page = openFile(targetFile);
         watchPage(page.key);
         session.activeKey = page.key;
         session.visited.add(page.key);

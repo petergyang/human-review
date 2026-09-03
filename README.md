@@ -48,9 +48,9 @@ Review a page running on localhost:
 
 Human Review opens the file in your browser. Make direct edits, leave comments, and click Send. Your agent receives all your feedback in one batch, updates the source, and refreshes the page for another review.
 
-The agent waits with a single background command that exits the moment you hit Send — no polling on a timer. Closing the tab, or clicking End review, releases the agent too. Feedback you never sent is kept, and the next time you open that page you can restore or discard it.
+In Claude Code, the agent waits in the background and picks up your feedback the moment you hit Send. In Codex and other agents, it waits during its turn; if the turn already ended, send a message and it picks the feedback up. Closing the tab or clicking End review releases the agent either way. Feedback you never sent is kept, and the next time you open that page you can restore or discard it.
 
-Note: For HTML files, direct edits and resizes save automatically. For Markdown and localhost pages, click Send so your agent can apply them to the source.
+Note: For HTML files, direct edits and resizes save automatically, so closing the tab doesn't undo them — Discard on your next open, or Revert all during the review, puts the file back. For Markdown and localhost pages, click Send so your agent can apply them to the source.
 
 ## What this skill lets you do
 
