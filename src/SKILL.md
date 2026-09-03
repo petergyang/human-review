@@ -125,8 +125,10 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   or their fix disappears on the next build.
 - **`edits_saved: true` means those edits are already in the file on disk.**
   Plain HTML files autosave as the user types, so your copy of the file is
-  stale. Re-read the file before touching it and make targeted changes only;
-  never regenerate it from what you wrote earlier, or their work disappears.
+  stale. Those rows need no action — do not re-apply them. Re-read the file
+  before touching it, work on the comments, and leave every edited block
+  exactly as it is on disk; never regenerate the file from what you wrote
+  earlier, or their work disappears.
   `edits_saved: false` (Markdown, localhost pages, self-rendering HTML) means the
   edits exist only in this batch — apply them to the source yourself.
 - An edit with `kind: "deleted"` means the user removed that whole block:
@@ -136,7 +138,9 @@ One batch covers every page the user visited, grouped by file or localhost URL.
 - When `before_html`/`after_html` are present, the user changed formatting, not
   just words — bold, italic, underline, links. Use the HTML version to carry the
   formatting into the source, translated to its syntax (e.g. `<strong>` → `**`
-  in Markdown/MDX).
+  in Markdown/MDX). `formatting_only: true` means the words did not change at
+  all: apply `after_html`, and never write `after` back as plain text — that
+  strips the formatting the user just added.
 - A page with `kind: "url"` was edited directly in the review UI. Its `file`
   and `url` fields name the localhost route, not a writable file. Find the
   matching project source (such as MDX, TSX, or a template), apply every edit

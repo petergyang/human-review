@@ -341,6 +341,29 @@ test("rewording a comment updates a waiting batch in place and takes a new id af
   acked.req.destroy();
 });
 
+test("a formatting-only edit is flagged, and saved pages say their edits need no action", async (t) => {
+  const file = htmlFile("bold.html");
+  const { port, token, dispose } = await start(0);
+  t.after(() => dispose());
+  const opened = await open(port, token, file);
+  await edit(port, token, opened.key, {
+    label: "p",
+    before: "Alpha",
+    after: "Alpha",
+    before_html: "<p>Alpha</p>",
+    after_html: "<p><b>Alpha</b></p>",
+  });
+  await edit(port, token, opened.key, { label: "p 2", before: "Beta", after: "Gamma", before_html: "<p>Beta</p>", after_html: "<p>Gamma</p>" });
+  await send(port, token, opened.key, opened.sessionId);
+  const batch = await poll(port, token, file).promise;
+  const [bold, reworded] = batch.pages[0].edits;
+  assert.equal(bold.formatting_only, true);
+  assert.equal(bold.after_html, "<p><b>Alpha</b></p>");
+  assert.equal(reworded.formatting_only, undefined);
+  assert.match(batch.next_step, /formatting_only: true.*never write `after` back as plain text/);
+  assert.match(batch.next_step, /edits_saved: true.*need no action/);
+});
+
 test("a self-rendering page reports edits_saved: false", async (t) => {
   const file = htmlFile("dynamic.html");
   const { port, token, dispose } = await start(0);

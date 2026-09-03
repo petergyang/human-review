@@ -384,6 +384,9 @@ export function createServer() {
           after: e.after,
           ...(e.before_html !== undefined && e.before_html !== e.before ? { before_html: e.before_html } : {}),
           ...(e.after_html !== undefined && e.after_html !== e.after ? { after_html: e.after_html } : {}),
+          // Same words, different markup: bold, italic, a link. `after` alone
+          // would read as "nothing changed" — or worse, as plain text to write back.
+          ...(e.kind === "edited" && e.before === e.after && e.after_html !== undefined && e.after_html !== e.before_html ? { formatting_only: true } : {}),
           ...(e.kind === "moved" ? { moved_after: e.moved_after || "", moved_before: e.moved_before || "" } : {}),
           ...(Array.isArray(e.staged_assets) && e.staged_assets.length ? { staged_assets: e.staged_assets } : {}),
           ...(e.truncated ? { truncated: true } : {}),
@@ -420,6 +423,7 @@ export function createServer() {
     const hasMarkdown = pages.some((p) => p.markdown);
     const hasUrl = pages.some((p) => p.kind === "url");
     const hasSaved = pages.some((p) => p.edits_saved && p.edits.length);
+    const hasFormatting = pages.some((p) => p.edits.some((e) => e.formatting_only));
     const hasTruncated = pages.some((p) => p.edits.some((e) => e.truncated));
     const batch = {
       status: "feedback",
@@ -439,9 +443,14 @@ export function createServer() {
         "changes the human already made: `after` is their exact new wording, so carry it across verbatim, and " +
         "never revert it. When an edit carries `after_html`, the human changed formatting (bold, italic, links) — " +
         "use the HTML version, translated into the source's own syntax. " +
+        (hasFormatting
+          ? "An edit with `formatting_only: true` changed markup, not words: apply `after_html` and never write `after` " +
+            "back as plain text, which would strip the formatting. "
+          : "") +
         (hasSaved
-          ? "Pages with `edits_saved: true` already contain those edits on disk: re-read the file before touching it and " +
-            "make targeted changes only — never regenerate it from an older copy, or their work disappears. "
+          ? "Pages with `edits_saved: true` already contain their `edits` on disk — those rows need no action and must " +
+            "not be re-applied. Re-read the file before touching it, work on the comments only, and keep every edited " +
+            "block exactly as it is on disk; never regenerate the file from an older copy, or their work disappears. "
           : "") +
         (hasTruncated
           ? "An edit marked `truncated` had its text cut at " + EDIT_TEXT_CAP + " characters; read the block from the page itself. "
