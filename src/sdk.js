@@ -10,6 +10,14 @@ import { hashClickAction, navigationHref } from "./click-target.js";
 import { linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
 import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 
+/**
+ * True when an "Enter" keydown is really an IME confirming its composition
+ * (e.g. finalizing kanji conversion), not the user asking to submit.
+ */
+function isImeCommitEnter(event) {
+  return Boolean(event.isComposing || event.keyCode === 229);
+}
+
 const SAVE_DEBOUNCE_MS = 700;
 const EDIT_FLUSH_MS = 500;
 const MEDIA = /^(img|svg|canvas|video|picture|iframe|hr|figure)$/i;
@@ -356,6 +364,18 @@ const clip = (text, limit = 40) => {
  */
 const pinnedLabels = new WeakMap();
 
+/**
+ * Sibling order as the page loaded. Ordinals in labels ("p 3") come from
+ * here, so deleting a paragraph does not renumber the ones after it and hand
+ * two different blocks the same label within one review.
+ */
+const bootChildren = new WeakMap();
+function snapshotOrder() {
+  for (const el of [document.body, ...document.body.querySelectorAll("*")]) {
+    if (el.children.length > 1 && !isOurs(el)) bootChildren.set(el, [...el.children]);
+  }
+}
+
 /** The block a hover/edit belongs to, plus a human label for the edit list. */
 function targetFor(node) {
   const el = node && node.nodeType === 1 ? node : node && node.parentElement;
@@ -375,11 +395,16 @@ function targetFor(node) {
   }
 
   if (!pinnedLabels.has(block)) {
-    const heading = precedingHeading(block);
+    // A heading names itself; the heading before it would mislabel the edit.
+    const heading = /^h[1-6]$/i.test(block.tagName) ? "" : precedingHeading(block);
     const tag = block.tagName.toLowerCase();
     // Siblings of the same tag would otherwise share a label and collapse into
-    // one edit row, so number them.
-    const twins = block.parentElement ? [...block.parentElement.children].filter((c) => c.tagName === block.tagName) : [];
+    // one edit row, so number them — by their order at load, not right now.
+    const parent = block.parentElement;
+    const live = parent ? [...parent.children] : [];
+    const booted = parent ? bootChildren.get(parent) : null;
+    const siblings = booted && booted.includes(block) ? booted : live;
+    const twins = siblings.filter((c) => c.tagName === block.tagName);
     const ordinal = twins.length > 1 ? ` ${twins.indexOf(block) + 1}` : "";
     pinnedLabels.set(block, heading ? `${clip(heading, 26)} · ${tag}${ordinal}` : clip(block.textContent, 40) || tag);
   }
@@ -711,6 +736,7 @@ function boot() {
   // real app stays directly editable, not just its initial HTML response.
   keepBodyEditable(document.body);
   document.body.spellcheck = false;
+  snapshotOrder();
   baseline = serialize();
   bootSnapshot = baseline;
   watchSelfRendering();
@@ -761,7 +787,8 @@ function boot() {
       }
 
       // Plain clicks belong to editing: never navigate, never fire artifact JS.
-      if (href || (event.target.closest && event.target.closest("button, [role='button'], summary"))) {
+      // A <summary> keeps its native toggle: collapsed content must stay reachable.
+      if (href || (event.target.closest && event.target.closest("button, [role='button']"))) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -855,6 +882,12 @@ function boot() {
     scheduleSave();
   });
 
+  /**
+   * Delete and move are the two gestures with no native undo, so the last
+   * one is kept restorable: the element itself, detached, plus where it was.
+   */
+  let undoable = null; // { kind, el, parent, next, label }
+
   els.chipDelete.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -863,13 +896,28 @@ function boot() {
     const target = targetFor(hoverTarget);
     const label = target ? target.label : "Element";
     const before = hoverTarget.textContent;
+    undoable = { kind: "deleted", el: hoverTarget, parent: hoverTarget.parentNode, next: hoverTarget.nextSibling, label };
     hoverTarget.remove();
     hoverTarget = null;
     place(els.outline, null);
     showChip(null);
     queueEdit({ label, kind: "deleted", before, after: "" });
     flushSave();
+    post("eh:undoable", { label, kind: "deleted" });
   });
+
+  const restoreBlock = (label, kind) => {
+    const undo = undoable;
+    undoable = null;
+    if (!undo || undo.label !== label || undo.kind !== kind) return;
+    if (!undo.parent || !undo.parent.isConnected) return;
+    const next = undo.next && undo.next.parentNode === undo.parent ? undo.next : null;
+    undo.parent.insertBefore(undo.el, next);
+    undo.el.style.opacity = "";
+    // The chrome drops the row; the block is back to its captured original,
+    // so there is nothing new to report — only the file to write again.
+    flushSave();
+  };
 
   // beforeinput still sees the untouched wording, so capture it once per block.
   const originalText = new WeakMap();
@@ -880,6 +928,69 @@ function boot() {
       originalHtml.set(el, blockHtml(el));
     }
   };
+
+  /**
+   * A list command replaces the paragraph with fresh <li>/<ul> elements. They
+   * inherit its label and captured original, so the edit row still reads
+   * "this paragraph became a list" instead of a row for an unknown block with
+   * no `before`.
+   */
+  const adoptIdentity = (source, created) => {
+    if (!source || !created || created === source.el) return;
+    // The input event fired inside execCommand, before this ran, and the
+    // fresh element named itself ("li 3", no `before`). Retract that row.
+    const stale = pinnedLabels.get(created);
+    if (stale && stale !== source.label) editQueue.delete(`${stale}\u0000edited`);
+    pinnedLabels.set(created, source.label);
+    if (!originalText.has(created) && originalText.has(source.el)) {
+      originalText.set(created, originalText.get(source.el));
+      originalHtml.set(created, originalHtml.get(source.el));
+    }
+  };
+
+  const afterListCommand = (source) => {
+    const sel = document.getSelection();
+    polishNewList(sel);
+    if (!source || source.authored) return;
+    const node = sel && sel.anchorNode;
+    const el = node && (node.nodeType === 1 ? node : node.parentElement);
+    const item = el && el.closest ? el.closest("li") : null;
+    const list = item ? item.closest("ul, ol") : null;
+    adoptIdentity(source, item);
+    adoptIdentity(source, list);
+    if (item) emitBlockEdit(item, source.label);
+  };
+
+  /**
+   * Every block a selection touches. Typing over a selection that runs from
+   * one paragraph into the next changes both — the second may vanish
+   * entirely — and each needs its own row.
+   */
+  const blocksInRange = (range) => {
+    const found = [];
+    const add = (node) => {
+      const target = targetFor(node);
+      if (target && !found.some((t) => t.el === target.el)) found.push(target);
+    };
+    add(range.startContainer);
+    add(range.endContainer);
+    if (range.collapsed) return found;
+    const root = range.commonAncestorContainer;
+    const scope = root.nodeType === 1 ? root : root.parentElement;
+    if (!scope) return found;
+    const walker = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT, {
+      acceptNode: (el) => (isOurs(el) || !range.intersectsNode(el) ? NodeFilter.FILTER_REJECT : isBlock(el) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP),
+    });
+    let el = walker.nextNode();
+    let budget = 400;
+    while (el && budget > 0) {
+      add(el);
+      el = walker.nextNode();
+      budget -= 1;
+    }
+    return found;
+  };
+  let affected = null; // targets of a multi-block selection, until the input event reports them
 
   /** An edit row for a block changed outside the input-event flow (attribute
    * set, link removal, drag move) — the same shape the input listener emits. */
@@ -932,8 +1043,12 @@ function boot() {
       // From here on, DOM drift is the human typing, not the page rendering.
       userEdited = true;
       const sel = document.getSelection();
-      const target = targetFor(sel && sel.anchorNode ? sel.anchorNode : event.target);
+      const range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+      const blocks = range ? blocksInRange(range) : [];
+      const target = blocks[0] || targetFor(event.target);
       if (target) captureOriginal(target.el);
+      for (const block of blocks) captureOriginal(block.el);
+      affected = blocks.length > 1 ? blocks : null;
     },
     true
   );
@@ -1058,6 +1173,7 @@ function boot() {
   els.linkInput.addEventListener("keydown", (event) => {
     event.stopPropagation();
     if (event.key === "Enter") {
+      if (isImeCommitEnter(event)) return;
       event.preventDefault();
       applyLink();
     } else if (event.key === "Escape") {
@@ -1108,7 +1224,7 @@ function boot() {
         userEdited = true;
         captureOriginal(target.el);
         document.execCommand(event.code === "Digit7" ? "insertOrderedList" : "insertUnorderedList");
-        polishNewList(document.getSelection());
+        afterListCommand(target);
         scheduleSave();
         return;
       }
@@ -1161,7 +1277,7 @@ function boot() {
         sel.addRange(lead);
         document.execCommand("delete");
         document.execCommand(command);
-        polishNewList(document.getSelection());
+        afterListCommand(target);
         scheduleSave();
       }
     },
@@ -1311,6 +1427,7 @@ function boot() {
     const next = drop.before ? drop.ref : drop.ref.nextElementSibling;
     if (next === el || (drop.before ? drop.ref.previousElementSibling : drop.ref) === el) return;
     userEdited = true;
+    undoable = { kind: "moved", el, parent: el.parentNode, next: el.nextSibling, label };
     drop.ref.parentNode.insertBefore(el, next);
     const prev = el.previousElementSibling;
     const following = el.nextElementSibling;
@@ -1325,6 +1442,7 @@ function boot() {
       moved_before: following ? clip(following.textContent, 90) : "",
     });
     flushSave();
+    post("eh:undoable", { label, kind: "moved" });
   });
 
   // ------------------------------------------------------------- image paste
@@ -1390,6 +1508,18 @@ function boot() {
     if (pending) {
       clearPending();
       post("eh:dismiss", {});
+    }
+    if (affected) {
+      // A selection spanning blocks: the first absorbed the rest, and any
+      // block that is gone now is a deletion in its own right.
+      const blocks = affected;
+      affected = null;
+      for (const block of blocks) {
+        if (block.el.isConnected) emitBlockEdit(block.el, block.label);
+        else queueEdit({ label: block.label, kind: "deleted", before: originalText.get(block.el), after: "", before_html: originalHtml.get(block.el), after_html: "" });
+      }
+      scheduleSave();
+      return;
     }
     const sel = document.getSelection();
     const node = sel && sel.anchorNode ? sel.anchorNode : event.target;
@@ -1499,6 +1629,9 @@ function boot() {
         break;
       case "eh:assetFailed":
         pendingPastes.delete(msg.id);
+        break;
+      case "eh:undo":
+        restoreBlock(String(msg.label || ""), String(msg.kind || ""));
         break;
       default:
         break;

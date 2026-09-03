@@ -74,7 +74,7 @@ test("a localhost route is visually editable and returns source-directed feedbac
     body: { target },
   });
   assert.equal(opened.status, 200, opened.raw);
-  const { key, sessionId } = JSON.parse(opened.raw);
+  const { key, sessionId, artifactToken } = JSON.parse(opened.raw);
 
   const state = await request(review.port, review.token, { route: `/api/page/${key}` });
   const page = JSON.parse(state.raw);
@@ -84,7 +84,7 @@ test("a localhost route is visually editable and returns source-directed feedbac
   assert.equal(page.feedbackOnly, true);
   assert.equal(page.canRevert, false);
 
-  const artifact = await request(review.port, review.token, { route: `/artifact/${key}/index.html` });
+  const artifact = await request(review.port, review.token, { route: `/artifact/${artifactToken}/${key}/index.html` });
   assert.equal(artifact.status, 200, artifact.raw);
   assert.match(artifact.raw, /<h1>Wiki<\/h1>/);
   assert.doesNotMatch(artifact.raw, /<base/);

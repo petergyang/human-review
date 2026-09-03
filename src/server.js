@@ -39,6 +39,20 @@ const WATCH_INTERVAL_MS = 400;
 const IDLE_SHUTDOWN_MS = Number(process.env.HUMAN_REVIEW_IDLE_MS || 45 * 60 * 1000);
 /** A window with no live connection this long is treated as closed for good. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
+/** After a tab says it is going away, how long a reload has to come back. */
+const CLOSE_GRACE_MS = Number(process.env.HUMAN_REVIEW_CLOSE_GRACE_MS || 5000);
+/** A session no tab ever connected to (the browser never opened) is dropped after this long. */
+const NEVER_OPENED_MS = Number(process.env.HUMAN_REVIEW_NEVER_OPENED_MS || 60 * 1000);
+/** A poll with no review open waits this long for one before giving up. */
+const NO_REVIEW_GRACE_MS = Number(process.env.HUMAN_REVIEW_NO_REVIEW_GRACE_MS || 10000);
+/** Edit text is capped so one pasted novel cannot bloat the state file; the cut is marked. */
+const EDIT_TEXT_CAP = 200000;
+const TRUNCATED_MARK = " …[truncated by human-review]";
+
+const SUPERSEDED = {
+  status: "superseded",
+  next_step: "A newer poll for this target took over the wait. Stop here and do not run the poll command again from this task.",
+};
 const MAX_LOCAL_REDIRECTS = 5;
 /** Generous enough for a dev server's cold compile, but a wedged one can't hang us forever. */
 const LOCAL_FETCH_TIMEOUT_MS = 30000;
@@ -158,8 +172,15 @@ export function createServer() {
   const pollers = new Map(); // entryKey -> Set<{ res, timer }>
   /** Pending batches awaiting --ack; mirrored to the store so they survive restarts. */
   const batches = new Map(
-    Object.entries(store.allBatches()).map(([key, record]) => [key, { batch: record.batch, cleanup: record.cleanup, delivered: false }])
+    Object.entries(store.allBatches()).map(([key, record]) => [
+      key,
+      { batch: record.batch, cleanup: record.cleanup, delivered: !!record.delivered, priorCleanup: record.priorCleanup || null },
+    ])
   );
+  /** Unguessable path segment for the artifact route, which the iframe cannot send a header to. */
+  const viewToken = crypto.randomBytes(8).toString("hex");
+  /** The localhost page most recently served, for proxying its app's own requests. */
+  let lastUrlPageKey = null;
   const watched = new Map(); // key -> { file }
   const lastWritten = new Map(); // key -> content hash human-review itself wrote
 
@@ -194,6 +215,9 @@ export function createServer() {
   function agentState(entryKey) {
     const pending = batches.get(entryKey);
     if (pending && pending.delivered) return "working";
+    // Sent while the agent was still applying the previous batch: it ships
+    // with the agent's next poll, so nobody needs to do anything.
+    if (pending && pending.priorCleanup) return "queued";
     const set = pollers.get(entryKey);
     if (set && set.size) return "listening";
     return pending ? "stranded" : "idle";
@@ -202,6 +226,57 @@ export function createServer() {
   function broadcastAgent(entryKey) {
     const state = agentState(entryKey);
     for (const session of sessionsForEntry(entryKey)) emit(session, "agent", { state });
+  }
+
+  /** Unsent feedback on every page reachable from this entry target. */
+  function unsentCounts(entryKey) {
+    const keys = new Set([entryKey]);
+    for (const session of sessions.values()) {
+      if (session.entryKey !== entryKey) continue;
+      for (const k of session.visited) keys.add(k);
+    }
+    let comments = 0;
+    let edits = 0;
+    for (const k of keys) {
+      const page = store.page(k);
+      if (!page) continue;
+      comments += page.comments.length;
+      edits += page.edits.length;
+    }
+    return { comments, edits };
+  }
+
+  const CLOSE_REASONS = {
+    ended: "The user ended this review from the browser.",
+    window_closed: "The user closed the review tab without sending.",
+    no_review_open: "No review is open for this target in the browser.",
+  };
+
+  function closedPayload(entryKey, reason) {
+    const unsent = unsentCounts(entryKey);
+    const left = unsent.comments + unsent.edits;
+    return {
+      status: "closed",
+      reason,
+      unsent,
+      next_step:
+        `${CLOSE_REASONS[reason] || CLOSE_REASONS.ended} Stop waiting — do not run the poll command again. ` +
+        (left
+          ? `${left} unsent ${left === 1 ? "item was" : "items were"} left behind; they are kept and the user can restore or discard them the next time this target is reviewed. Tell the user in one line, then stop.`
+          : "Nothing was left unsent. Tell the user the review closed, then stop."),
+    };
+  }
+
+  /** Hand every waiting poll for a target its final answer. */
+  function releasePollers(entryKey, payload) {
+    const set = pollers.get(entryKey);
+    if (!set) return;
+    for (const poller of [...set]) {
+      clearInterval(poller.timer);
+      clearTimeout(poller.graceTimer);
+      set.delete(poller);
+      poller.res.end(JSON.stringify(payload));
+    }
   }
 
   // ------------------------------------------------------------- file watch
@@ -223,7 +298,9 @@ export function createServer() {
       // Our own autosave must never bounce back as a reload.
       if (lastWritten.get(key) === current) return;
       lastWritten.set(key, current);
-      store.setPristine(key, html);
+      // Rows on a Markdown or self-rendering page are unsent feedback, not
+      // something this write already contains; keep them.
+      store.setPristine(key, html, { keepEdits: isMarkdown(page.file) || !!store.page(key)?.dynamic });
       for (const session of sessionsForKey(key)) emit(session, "reload", { key });
     });
   }
@@ -251,33 +328,49 @@ export function createServer() {
     return true;
   }
 
-  /** Every page you left feedback on ships in one batch, grouped by target. */
-  function collectPages(session) {
+  /**
+   * Every page you left feedback on ships in one batch, grouped by target.
+   * `already` is the cleanup of a batch the agent has but has not acked yet:
+   * anything it covers is in the agent's hands already and must not ship twice.
+   */
+  function collectPages(session, already = []) {
     const out = [];
     for (const key of session.visited) {
       const page = store.page(key);
       if (!page) continue;
-      if (!page.comments.length && !page.edits.length) continue;
+      const covered = already.filter((entry) => entry.key === key);
+      const coveredIds = new Set(covered.flatMap((entry) => entry.ids));
+      const coveredUntil = covered.reduce((max, entry) => Math.max(max, entry.sentAt || 0), 0);
+      const comments = page.comments.filter((c) => !coveredIds.has(c.id));
+      const edits = page.edits.filter((e) => (e.updatedAt || e.at || 0) >= coveredUntil);
+      if (!comments.length && !edits.length) continue;
+      const markdown = page.kind !== "url" && isMarkdown(page.file);
       out.push({
         key,
         kind: page.kind === "url" ? "url" : "file",
         file: page.kind === "url" ? page.url : page.file,
         url: page.kind === "url" ? page.url : undefined,
-        comments: page.comments.map((c) => ({
+        markdown,
+        // Direct edits to a plain HTML file are autosaved into it as they
+        // happen; everywhere else they exist only in this batch.
+        edits_saved: page.kind !== "url" && !markdown && !page.dynamic,
+        comments: comments.map((c) => ({
           id: c.id,
           kind: c.kind,
           quote: c.quote,
           anchor: c.anchor,
           feedback: c.feedback,
         })),
-        edits: page.edits.map((e) => ({
+        edits: edits.map((e) => ({
           label: e.label,
           kind: e.kind,
           before: e.before,
           after: e.after,
           ...(e.before_html !== undefined && e.before_html !== e.before ? { before_html: e.before_html } : {}),
           ...(e.after_html !== undefined && e.after_html !== e.after ? { after_html: e.after_html } : {}),
+          ...(e.kind === "moved" ? { moved_after: e.moved_after || "", moved_before: e.moved_before || "" } : {}),
           ...(Array.isArray(e.staged_assets) && e.staged_assets.length ? { staged_assets: e.staged_assets } : {}),
+          ...(e.truncated ? { truncated: true } : {}),
         })),
       });
     }
@@ -299,14 +392,30 @@ export function createServer() {
     const session = sessions.get(sessionId);
     if (!session) return { error: "unknown session" };
 
-    const pages = collectPages(session);
-    if (!pages.length && !note) return { error: "nothing to send" };
+    // A batch the agent took but has not acked is in its hands: the new Send
+    // carries only what came after it, and the old cleanup rides along so the
+    // agent's next --ack clears both.
+    const previous = batches.get(session.entryKey);
+    const inFlight = previous && previous.delivered ? previous : null;
+    const already = inFlight ? [...(inFlight.priorCleanup || []), ...inFlight.cleanup] : previous ? previous.priorCleanup || [] : [];
+    const pages = collectPages(session, already);
+    if (!pages.length && !note) return { error: inFlight ? "nothing new since the batch the agent is working on" : "nothing to send" };
 
-    const hasMarkdown = pages.some((p) => p.kind === "file" && isMarkdown(p.file));
+    const hasMarkdown = pages.some((p) => p.markdown);
     const hasUrl = pages.some((p) => p.kind === "url");
+    const hasSaved = pages.some((p) => p.edits_saved && p.edits.length);
+    const hasTruncated = pages.some((p) => p.edits.some((e) => e.truncated));
     const batch = {
       status: "feedback",
-      pages: pages.map(({ kind, file, url, comments, edits }) => ({ kind, file, ...(url ? { url } : {}), comments, edits })),
+      pages: pages.map(({ kind, file, url, markdown, edits_saved, comments, edits }) => ({
+        kind,
+        file,
+        ...(url ? { url } : {}),
+        ...(markdown ? { markdown: true } : {}),
+        edits_saved,
+        comments,
+        edits,
+      })),
       overall_note: note || "",
       sent_at: new Date().toISOString(),
       next_step:
@@ -314,6 +423,13 @@ export function createServer() {
         "changes the human already made: `after` is their exact new wording, so carry it across verbatim, and " +
         "never revert it. When an edit carries `after_html`, the human changed formatting (bold, italic, links) — " +
         "use the HTML version, translated into the source's own syntax. " +
+        (hasSaved
+          ? "Pages with `edits_saved: true` already contain those edits on disk: re-read the file before touching it and " +
+            "make targeted changes only — never regenerate it from an older copy, or their work disappears. "
+          : "") +
+        (hasTruncated
+          ? "An edit marked `truncated` had its text cut at " + EDIT_TEXT_CAP + " characters; read the block from the page itself. "
+          : "") +
         (hasMarkdown
           ? "Markdown pages were reviewed rendered, so quotes and `after` wording use the rendered text — apply " +
             "the change to the Markdown source, keeping its formatting syntax. "
@@ -331,6 +447,7 @@ export function createServer() {
     const record = {
       batch,
       delivered: false,
+      priorCleanup: already.length ? already : null,
       cleanup: pages.map((p) => ({
         key: p.key,
         ids: p.comments.map((c) => c.id),
@@ -339,22 +456,16 @@ export function createServer() {
       })),
     };
     batches.set(session.entryKey, record);
-    store.setBatch(session.entryKey, record);
     record.delivered = deliver(session.entryKey, batch);
+    store.setBatch(session.entryKey, record);
     broadcastAgent(session.entryKey);
     return { ok: true };
   }
 
-  function ack(entryKey) {
-    const pending = batches.get(entryKey);
-    // Only a delivered batch can be acknowledged. An agent whose previous poll
-    // timed out re-runs `poll --ack`; if feedback arrived in between, that ack
-    // refers to an older batch and must not destroy the one it never saw.
-    if (!pending || !pending.delivered) return false;
-    batches.delete(entryKey);
-    store.clearBatch(entryKey);
+  /** Forget the feedback a batch carried, now that the agent has applied it. */
+  function applyCleanup(entryKey, cleanup) {
     const stagedRoot = path.join(stateDir(), "pasted");
-    for (const file of pending.cleanup.flatMap((entry) => entry.staged || [])) {
+    for (const file of cleanup.flatMap((entry) => entry.staged || [])) {
       const resolved = path.resolve(file);
       const relative = path.relative(stagedRoot, resolved);
       if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
@@ -363,47 +474,71 @@ export function createServer() {
         fs.rmdirSync(path.dirname(resolved));
       } catch {}
     }
-    for (const { key, ids, sentAt } of pending.cleanup) store.clearSent(key, ids, sentAt);
+    for (const { key, ids, sentAt } of cleanup) store.clearSent(key, ids, sentAt);
     for (const session of sessionsForEntry(entryKey)) emit(session, "refresh", {});
     // File targets reload through fs.watch. URL targets have no source file to
     // watch, so acknowledgement is the signal to fetch the rebuilt route.
-    for (const { key } of pending.cleanup) {
+    for (const { key } of cleanup) {
       if (store.page(key)?.kind === "url") {
         for (const session of sessionsForKey(key)) emit(session, "reload", { key });
       }
     }
+  }
+
+  function ack(entryKey) {
+    const pending = batches.get(entryKey) || store.batchFromDisk(entryKey);
+    if (!pending) return false;
+    if (!pending.delivered) {
+      // The agent is acking the batch it had, which a newer Send has since
+      // queued behind. Clear that one; the new batch is delivered untouched.
+      if (!pending.priorCleanup) return false;
+      const prior = pending.priorCleanup;
+      pending.priorCleanup = null;
+      batches.set(entryKey, pending);
+      store.setBatch(entryKey, pending);
+      applyCleanup(entryKey, prior);
+      broadcastAgent(entryKey);
+      return true;
+    }
+    batches.delete(entryKey);
+    store.clearBatch(entryKey);
+    applyCleanup(entryKey, [...(pending.priorCleanup || []), ...pending.cleanup]);
     broadcastAgent(entryKey);
     return true;
   }
 
   /**
-   * A deliberate stop, not a tab close: the browser forgets the session and
-   * any waiting agent is released with a clear "stop polling" answer instead
-   * of being left to burn its timeout. Unsent feedback stays in the store.
+   * The review is over — the user hit End review, closed the tab, or the tab
+   * never came back. The browser forgets the session and any waiting agent is
+   * released with a clear "stop" answer instead of waiting forever. Unsent
+   * feedback stays in the store; the next open offers to restore or discard it.
    */
-  function endSession(session) {
+  function endSession(session, reason = "ended") {
+    clearTimeout(session.awayTimer);
     sessions.delete(session.id);
     for (const res of session.clients) {
-      res.write(`event: ended\ndata: {}\n\n`);
+      res.write(`event: ended\ndata: ${JSON.stringify({ reason })}\n\n`);
       res.end();
     }
     session.clients.clear();
     // Another window on the same target keeps its agent connection alive.
     if (sessionsForEntry(session.entryKey).length > 0) return;
-    const set = pollers.get(session.entryKey);
-    if (!set) return;
-    for (const poller of [...set]) {
-      clearInterval(poller.timer);
-      set.delete(poller);
-      poller.res.end(
-        JSON.stringify({
-          status: "closed",
-          next_step:
-            "The user ended this review session. Stop polling — do not run the poll command again. " +
-            "Any unsent feedback is kept and will ship the next time this target is reviewed.",
-        })
-      );
-    }
+    // A batch the user sent must reach the agent before the close does; the
+    // poll route returns it first, and the closed answer follows on the next poll.
+    if (batches.get(session.entryKey)) return;
+    releasePollers(session.entryKey, closedPayload(session.entryKey, reason));
+  }
+
+  /**
+   * The tab said it is unloading. A reload reconnects within moments; a real
+   * close never does, and then the review ends and the waiting agent is freed.
+   */
+  function scheduleAway(session) {
+    clearTimeout(session.awayTimer);
+    session.awayTimer = setTimeout(() => {
+      if (!sessions.has(session.id) || session.clients.size > 0) return;
+      endSession(session, "window_closed");
+    }, CLOSE_GRACE_MS);
   }
 
   // ----------------------------------------------------------------- routes
@@ -501,6 +636,54 @@ export function createServer() {
     };
   }
 
+  const STATIC = {
+    "/chrome.css": ["chrome.css", null],
+    "/chrome.js": ["chrome-client.js", CORS],
+    "/chrome-session.js": ["chrome-session.js", CORS],
+    "/sdk.js": ["sdk.js", CORS],
+    "/editing.js": ["editing.js", CORS],
+    "/anchor-text.js": ["anchor-text.js", CORS],
+    "/frame-policy.js": ["frame-policy.js", CORS],
+    "/click-target.js": ["click-target.js", CORS],
+    "/serialize.js": ["serialize.js", CORS],
+  };
+
+  /**
+   * A localhost app under review keeps fetching from its own origin: API
+   * calls, route prefetches, chunk loads, images from `srcset`. Inside the
+   * review those land here instead, so anything that is not ours is passed
+   * through to the app, unchanged in both directions.
+   */
+  function proxyToApp(req, res, target) {
+    const headers = { ...req.headers, host: target.host };
+    delete headers.cookie;
+    const upstream = http.request(target, { method: req.method, headers }, (up) => {
+      const out = { ...up.headers };
+      // The response now lives on the review origin; app cookies must not
+      // land here, and frame-blocking headers would blank the iframe.
+      delete out["set-cookie"];
+      delete out["x-frame-options"];
+      delete out["content-security-policy"];
+      res.writeHead(up.statusCode || 502, out);
+      up.pipe(res);
+    });
+    upstream.on("error", (err) => {
+      if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`Could not reach ${target.href}: ${err.message}`);
+    });
+    req.pipe(upstream);
+  }
+
+  /** The localhost page whose app a stray request belongs to, if any. */
+  function appPageFor(req) {
+    const cookie = String(req.headers.cookie || "");
+    const match = cookie.match(/(?:^|;\s*)__hr_page=([a-f0-9]+)/);
+    const fromCookie = match ? store.page(match[1]) : null;
+    if (fromCookie && fromCookie.kind === "url") return fromCookie;
+    const last = lastUrlPageKey ? store.page(lastUrlPageKey) : null;
+    return last && last.kind === "url" ? last : null;
+  }
+
   const server = http.createServer(async (req, res) => {
     touch();
     const url = new URL(req.url, "http://127.0.0.1");
@@ -519,6 +702,14 @@ export function createServer() {
 
       if (route === "/health") return json(res, 200, { ok: true, pid: process.pid, protocol: SERVER_PROTOCOL });
 
+      // Our own callers always send the token; an app under review never
+      // does. Anything else it asks for is its own, and goes to the app.
+      const ours = STATIC[route] || route.startsWith("/artifact/") || route.startsWith("/s/") || route.startsWith("/events/");
+      if (!ours && !req.headers["x-human-review-token"]) {
+        const appPage = appPageFor(req);
+        if (appPage) return proxyToApp(req, res, new URL(`${route}${url.search}`, appPage.url));
+      }
+
       // Every API route needs the per-run token; static assets and the
       // unguessable /s/<id> chrome page do not.
       // Header only — a token in a query string would leak into logs and
@@ -531,15 +722,7 @@ export function createServer() {
       }
 
       // --- static chrome assets
-      if (route === "/chrome.css") return serveFile(res, path.join(here, "chrome.css"));
-      if (route === "/chrome.js") return serveFile(res, path.join(here, "chrome-client.js"), CORS);
-      if (route === "/chrome-session.js") return serveFile(res, path.join(here, "chrome-session.js"), CORS);
-      if (route === "/sdk.js") return serveFile(res, path.join(here, "sdk.js"), CORS);
-      if (route === "/editing.js") return serveFile(res, path.join(here, "editing.js"), CORS);
-      if (route === "/anchor-text.js") return serveFile(res, path.join(here, "anchor-text.js"), CORS);
-      if (route === "/frame-policy.js") return serveFile(res, path.join(here, "frame-policy.js"), CORS);
-      if (route === "/click-target.js") return serveFile(res, path.join(here, "click-target.js"), CORS);
-      if (route === "/serialize.js") return serveFile(res, path.join(here, "serialize.js"), CORS);
+      if (STATIC[route]) return serveFile(res, path.join(here, STATIC[route][0]), STATIC[route][1] || undefined);
 
       // --- open a browser session for a file or localhost URL
       if (route === "/api/session" && req.method === "POST") {
@@ -558,8 +741,25 @@ export function createServer() {
         }
         watchPage(page.key);
         const id = uid("s");
-        sessions.set(id, { id, entryKey: page.key, activeKey: page.key, visited: new Set([page.key]), clients: new Set(), lastSeen: Date.now() });
-        return json(res, 200, { sessionId: id, key: page.key, path: `/s/${id}` });
+        // Feedback already on the page is from an earlier review that ended
+        // without a Send; the browser offers to restore or discard it.
+        const leftover = { comments: page.comments.length, edits: page.edits.length };
+        sessions.set(id, {
+          id,
+          entryKey: page.key,
+          activeKey: page.key,
+          visited: new Set([page.key]),
+          clients: new Set(),
+          lastSeen: Date.now(),
+          createdAt: Date.now(),
+          everConnected: false,
+          leftover,
+          awayTimer: null,
+        });
+        // A poll that was about to give up for lack of a review has one now.
+        for (const poller of pollers.get(page.key) || []) clearTimeout(poller.graceTimer);
+        broadcastAgent(page.key);
+        return json(res, 200, { sessionId: id, key: page.key, path: `/s/${id}`, artifactToken: viewToken, leftover });
       }
 
       // --- the chrome page
@@ -575,13 +775,15 @@ export function createServer() {
         return res.end(shell.replace("__SESSION_ID__", id).replace("__TOKEN__", token));
       }
 
-      // --- the reviewed page itself, plus sibling assets for file targets
+      // --- the reviewed page itself, plus sibling assets for file targets.
+      // The iframe cannot send the token header, so the URL carries a secret
+      // of its own: the page key alone is derived from the file path, which a
+      // dev server on another port could guess.
       if (route.startsWith("/artifact/")) {
-        const rest = route.slice("/artifact/".length);
-        const slash = rest.indexOf("/");
-        const key = slash === -1 ? rest : rest.slice(0, slash);
-        const asset = slash === -1 ? "" : rest.slice(slash + 1);
-        const page = store.page(key);
+        const parts = route.slice("/artifact/".length).split("/");
+        const [vt, key = ""] = parts;
+        const asset = parts.slice(2).join("/");
+        const page = vt === viewToken ? store.page(key) : null;
         if (!page) {
           res.writeHead(404, { "content-type": "text/plain" });
           return res.end("Unknown page");
@@ -611,7 +813,13 @@ export function createServer() {
             // Markdown reviews render on the fly; the source file stays untouched.
             if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
           }
-          res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" });
+          const headers = { "content-type": MIME[".html"], "cache-control": "no-store" };
+          if (page.kind === "url") {
+            // Names the app that later same-origin requests belong to.
+            lastUrlPageKey = key;
+            headers["set-cookie"] = `__hr_page=${key}; Path=/; SameSite=Lax`;
+          }
+          res.writeHead(200, headers);
           return res.end(injectSdk(html, key, sdkOptions));
         }
         if (page.kind === "url") {
@@ -624,8 +832,7 @@ export function createServer() {
             }
             return serveFile(res, path.join(stateDir(), "pasted", key, name));
           }
-          res.writeHead(404, { "content-type": "text/plain" });
-          return res.end("Localhost assets load from the reviewed development server.");
+          return proxyToApp(req, res, new URL(`${asset}${url.search}`, page.url));
         }
         const target = resolveAsset(page.file, asset.split("?")[0]);
         if (!target) {
@@ -638,28 +845,16 @@ export function createServer() {
       // --- agent status probe: is feedback waiting? is anyone listening?
       if (route === "/api/status" && req.method === "GET") {
         const entryKey = targetKey(url.searchParams.get("target") || url.searchParams.get("file") || "");
-        const pending = batches.get(entryKey);
+        const pending = batches.get(entryKey) || store.batchFromDisk(entryKey);
         const listening = (pollers.get(entryKey) || new Set()).size > 0;
-        // Unsent feedback lives on every page reachable from this entry.
-        const keys = new Set([entryKey]);
-        for (const session of sessions.values()) {
-          if (session.entryKey !== entryKey) continue;
-          for (const k of session.visited) keys.add(k);
-        }
-        let comments = 0;
-        let edits = 0;
-        for (const k of keys) {
-          const page = store.page(k);
-          if (!page) continue;
-          comments += page.comments.length;
-          edits += page.edits.length;
-        }
+        const reviewOpen = sessionsForEntry(entryKey).length > 0;
         return json(res, 200, {
           status: pending ? "feedback-waiting" : "idle",
           feedback_waiting: !!pending,
           agent_listening: listening,
+          review_open: reviewOpen,
           server_running: true,
-          unsent: { comments, edits },
+          unsent: unsentCounts(entryKey),
         });
       }
 
@@ -720,15 +915,40 @@ export function createServer() {
           const body = await readBody(req);
           const feedback = String(body.feedback || "").trim();
           if (!feedback) return json(res, 400, { error: "empty feedback" });
+          const carrying = [...batches.entries()].find(([, record]) =>
+            [...(record.priorCleanup || []), ...record.cleanup].some((entry) => entry.key === key && entry.ids.includes(tail))
+          );
+          if (carrying && !carrying[1].delivered && !(carrying[1].priorCleanup || []).some((e) => e.ids.includes(tail))) {
+            // Sent but not yet taken: the waiting batch can still be reworded in place.
+            if (!store.updateComment(key, tail, feedback)) return json(res, 404, { error: "unknown comment" });
+            const [entryKey, record] = carrying;
+            for (const page of record.batch.pages) {
+              for (const comment of page.comments) if (comment.id === tail) comment.feedback = feedback;
+            }
+            store.setBatch(entryKey, record);
+            return json(res, 200, { delivery: "updated-pending", page: pageState(key) });
+          }
+          if (carrying) {
+            // The agent already has the old wording. Retire that id so the
+            // ack does not clear the rewrite; it ships with the next Send.
+            if (!store.updateComment(key, tail, feedback, { newId: uid("c") })) return json(res, 404, { error: "unknown comment" });
+            return json(res, 200, { delivery: "resend", page: pageState(key) });
+          }
           if (!store.updateComment(key, tail, feedback)) return json(res, 404, { error: "unknown comment" });
-          return json(res, 200, { page: pageState(key) });
+          return json(res, 200, { delivery: "unsent", page: pageState(key) });
         }
 
         if (action === "edit" && req.method === "POST") {
           const body = await readBody(req);
           const label = String(body.label || "Document");
           const kind = body.kind === "deleted" ? "deleted" : body.kind === "moved" ? "moved" : "edited";
-          const cap = (s) => (typeof s === "string" ? s.slice(0, 4000) : undefined);
+          let truncated = false;
+          const cap = (s) => {
+            if (typeof s !== "string") return undefined;
+            if (s.length <= EDIT_TEXT_CAP) return s;
+            truncated = true;
+            return `${s.slice(0, EDIT_TEXT_CAP)}${TRUNCATED_MARK}`;
+          };
           const stagedRoot = path.join(stateDir(), "pasted", key);
           const stagedAssets = Array.isArray(body.staged_assets)
             ? body.staged_assets
@@ -747,11 +967,35 @@ export function createServer() {
                 })
                 .map(({ path: assetPath, preview_src }) => ({ path: assetPath, preview_src }))
             : [];
+          const fields = [cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html)];
           const extra = {
             ...(kind === "moved" ? { moved_after: cap(body.moved_after) || "", moved_before: cap(body.moved_before) || "" } : {}),
             ...(stagedAssets.length ? { staged_assets: stagedAssets } : {}),
+            ...(truncated ? { truncated: true } : {}),
           };
-          store.addEdit(key, label, kind, cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html), extra);
+          store.addEdit(key, label, kind, ...fields, extra);
+          return json(res, 200, { page: pageState(key) });
+        }
+
+        // Undo of a delete or move: the block is back where it was.
+        if (action === "edit" && req.method === "DELETE") {
+          const body = await readBody(req);
+          const kind = body.kind === "deleted" ? "deleted" : body.kind === "moved" ? "moved" : "edited";
+          store.removeEdit(key, String(body.label || ""), kind);
+          return json(res, 200, { page: pageState(key) });
+        }
+
+        // The SDK found the page renders itself; its edits are feedback only.
+        if (action === "mode" && req.method === "POST") {
+          const body = await readBody(req);
+          store.setDynamic(key, !!body.dynamic);
+          return json(res, 200, { page: pageState(key) });
+        }
+
+        // Leftover feedback from an earlier review the user chose not to keep.
+        if (action === "discard" && req.method === "POST") {
+          store.discardFeedback(key);
+          for (const session of sessionsForKey(key)) emit(session, "refresh", {});
           return json(res, 200, { page: pageState(key) });
         }
 
@@ -781,7 +1025,7 @@ export function createServer() {
           const saved = path.join(dir, name);
           fs.writeFileSync(saved, bytes);
           return json(res, 200, {
-            src: staged ? `/artifact/${key}/__human_review_paste__/${name}` : `assets/${name}`,
+            src: staged ? `/artifact/${viewToken}/${key}/__human_review_paste__/${name}` : `assets/${name}`,
             ...(staged ? { stagedId: name } : {}),
           });
         }
@@ -841,7 +1085,16 @@ export function createServer() {
       if (endMatch && req.method === "POST") {
         const session = sessions.get(endMatch[1]);
         if (!session) return json(res, 404, { error: "unknown session" });
-        endSession(session);
+        endSession(session, "ended");
+        return json(res, 200, { ok: true });
+      }
+
+      // --- the tab is unloading: a reload comes right back, a close never does
+      const awayMatch = route.match(/^\/api\/session\/(\w+)\/away$/);
+      if (awayMatch && req.method === "POST") {
+        const session = sessions.get(awayMatch[1]);
+        if (!session) return json(res, 404, { error: "unknown session" });
+        scheduleAway(session);
         return json(res, 200, { ok: true });
       }
 
@@ -855,6 +1108,8 @@ export function createServer() {
           key: session.activeKey,
           page: pageState(session.activeKey, session),
           others: otherPages(session),
+          artifactToken: viewToken,
+          leftover: session.leftover || { comments: 0, edits: 0 },
         });
       }
 
@@ -916,6 +1171,10 @@ export function createServer() {
           connection: "keep-alive",
         });
         res.write(": open\n\n");
+        // The tab that said it was leaving came back (a reload).
+        clearTimeout(session.awayTimer);
+        session.awayTimer = null;
+        session.everConnected = true;
         session.clients.add(res);
         seen(session);
         emit(session, "agent", { state: agentState(session.entryKey) });
@@ -934,25 +1193,45 @@ export function createServer() {
         const entryKey = targetKey(target);
         if (url.searchParams.get("ack") === "1") ack(entryKey);
 
-        const pending = batches.get(entryKey);
+        // Feedback first, always: a Send must reach the agent even if the tab
+        // closed right after it, and even if another server wrote it.
+        const pending = batches.get(entryKey) || store.batchFromDisk(entryKey);
         if (pending) {
+          batches.set(entryKey, pending);
           pending.delivered = true;
+          store.markDelivered(entryKey);
           broadcastAgent(entryKey);
           return json(res, 200, pending.batch);
         }
 
         res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         res.write(" ");
+        // One waiter per target: an older poll left behind by an earlier turn
+        // would otherwise take the next batch too, and apply it twice.
+        releasePollers(entryKey, SUPERSEDED);
         const set = pollers.get(entryKey) || new Set();
         pollers.set(entryKey, set);
         const poller = {
           res,
           timer: setInterval(() => res.write(" "), POLL_HEARTBEAT_MS),
+          graceTimer: null,
         };
+        // No review open for this target: give the browser a moment to open
+        // one (an `open` that is still launching, a tab re-registering after a
+        // server restart), then release the agent rather than wait forever.
+        if (sessionsForEntry(entryKey).length === 0) {
+          poller.graceTimer = setTimeout(() => {
+            if (!set.has(poller) || sessionsForEntry(entryKey).length > 0) return;
+            clearInterval(poller.timer);
+            set.delete(poller);
+            poller.res.end(JSON.stringify(closedPayload(entryKey, "no_review_open")));
+          }, NO_REVIEW_GRACE_MS);
+        }
         set.add(poller);
         broadcastAgent(entryKey);
         req.on("close", () => {
           clearInterval(poller.timer);
+          clearTimeout(poller.graceTimer);
           set.delete(poller);
           broadcastAgent(entryKey);
         });
@@ -969,9 +1248,12 @@ export function createServer() {
   const sweep = setInterval(() => {
     const now = Date.now();
 
-    // A window with no SSE client for a while is closed; forget its session.
-    for (const [id, session] of sessions) {
-      if (session.clients.size === 0 && now - session.lastSeen > SESSION_TTL_MS) sessions.delete(id);
+    // A window with no SSE client for a while is gone for good — a crash, a
+    // laptop that never woke — so the review ends and any waiting agent is freed.
+    for (const session of [...sessions.values()]) {
+      if (session.clients.size === 0 && now - session.lastSeen > SESSION_TTL_MS) endSession(session, "window_closed");
+      // Opened by the CLI but no browser ever showed up: nothing to wait for.
+      else if (!session.everConnected && session.clients.size === 0 && now - (session.createdAt || 0) > NEVER_OPENED_MS) endSession(session, "window_closed");
     }
 
     // Stop watching files no remaining session can see.
@@ -1001,7 +1283,120 @@ export function createServer() {
   return { server, store, token, dispose };
 }
 
-export function start(port = 0) {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function probeHealth(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 1200 }, (res) => {
+      let raw = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        raw += chunk;
+      });
+      res.on("end", () => {
+        try {
+          resolve(res.statusCode === 200 ? JSON.parse(raw) : null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => req.destroy());
+  });
+}
+
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+};
+
+const lockPath = () => path.join(stateDir(), "server.lock");
+let holdsLock = false;
+
+/**
+ * Exactly one review server per state directory. Two CLIs racing to start
+ * one would otherwise each spawn a server, and the browser tab would post
+ * to one while the agent polls the other, with feedback stranded between.
+ * A live server on the current protocol wins; an older one is asked to leave.
+ */
+async function claimServerSlot() {
+  ensureStateDir();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      fs.writeFileSync(lockPath(), String(process.pid), { flag: "wx" });
+      holdsLock = true;
+      break;
+    } catch {
+      let holder = 0;
+      try {
+        holder = Number(fs.readFileSync(lockPath(), "utf8"));
+      } catch {}
+      if (holder === process.pid) {
+        holdsLock = true;
+        break;
+      }
+      if (holder && pidAlive(holder)) {
+        // Another process is starting or running; let it, unless it is
+        // stale and never got as far as announcing itself.
+        await sleep(300);
+        const saved = readServerRecord();
+        if (saved && saved.pid === holder) return { proceed: false };
+        if (attempt < 2) continue;
+        return { proceed: false };
+      }
+      try {
+        fs.unlinkSync(lockPath());
+      } catch {}
+    }
+  }
+  if (!holdsLock) return { proceed: false };
+
+  const saved = readServerRecord();
+  if (saved && saved.pid && saved.pid !== process.pid) {
+    const health = await probeHealth(saved.port);
+    if (health && health.pid === saved.pid) {
+      if (saved.protocol === SERVER_PROTOCOL) return { proceed: false };
+      // An older server: it answered /health with its own pid, so this is
+      // ours to replace. Waiting polls reconnect to the new one on their own.
+      try {
+        process.kill(saved.pid, "SIGTERM");
+      } catch {}
+      for (let i = 0; i < 30 && (await probeHealth(saved.port)); i += 1) await sleep(100);
+    }
+  }
+  return { proceed: true };
+}
+
+function releaseServerSlot() {
+  if (!holdsLock) return;
+  holdsLock = false;
+  try {
+    if (Number(fs.readFileSync(lockPath(), "utf8")) === process.pid) fs.unlinkSync(lockPath());
+  } catch {}
+}
+
+function readServerRecord() {
+  try {
+    return JSON.parse(fs.readFileSync(serverPath(), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+process.on("exit", releaseServerSlot);
+
+export async function start(port = 0) {
+  const claim = await claimServerSlot();
+  if (!claim.proceed) {
+    const err = new Error("a human-review server is already running for this state directory");
+    err.code = "EALREADY";
+    throw err;
+  }
   const { server, store, token, dispose } = createServer();
   return new Promise((resolve, reject) => {
     // Without this, a busy HUMAN_REVIEW_PORT dies as an uncaught exception.

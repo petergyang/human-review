@@ -217,7 +217,7 @@ test("ending a review releases the waiting agent and keeps unsent feedback", asy
 
   const answer = JSON.parse((await polled).raw);
   assert.equal(answer.status, "closed", "the poller is released, not left to time out");
-  assert.match(answer.next_step, /Stop polling/);
+  assert.match(answer.next_step, /do not run the poll command again/);
 
   const gone = await request(port, token, { route: `/api/session/${opened.sessionId}/page` });
   assert.equal(gone.status, 404, "the session is forgotten");

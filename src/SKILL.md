@@ -28,32 +28,59 @@ keeping its formatting syntax.
    npx -y human-review http://localhost:3000/wiki
    ```
 
-3. Wait for feedback. This blocks until they hit Send, or the timeout passes:
+3. Wait for feedback. This command blocks until the user hits Send in the
+   browser, then prints their batch and exits:
 
    ```sh
-   npx -y human-review poll path/to/file.html --timeout 600
+   npx -y human-review poll path/to/file.html
    ```
 
-   Keep this command in the foreground. Do not end your turn while it is waiting.
-   If your shell returns a process or session handle, keep waiting on that handle
-   until the command exits. If it prints `{"status":"timeout"}`, no feedback has
-   arrived yet — run the same poll command again to keep waiting. Feedback is
-   saved even if a poll dies, so nothing is ever lost.
+   The command exits only when the user clicks Send or closes the review.
+   There is nothing to re-run, no interval to poll on, and no `--timeout` to
+   add. It survives the local server restarting, and feedback is saved even
+   if the poll dies, so nothing is ever lost. How you wait depends on your
+   harness:
 
-   If it prints `{"status":"closed"}`, the user ended the review from the
-   browser — stop polling and do not run the poll command again. Unsent
-   feedback is kept and ships the next time this target is reviewed.
+   - **Claude Code:** run it with `run_in_background: true` and end your turn.
+     Claude Code wakes you with the output the moment the command exits.
+   - **Codex, Cursor, and everything else:** run it in the **foreground**,
+     inside your active turn, and stay on it until it prints `feedback` or
+     `closed`. Do not detach it or start it as a background session: nothing
+     wakes you when a detached command finishes. While the review is active:
+     - If the user sends a message, answer it as commentary and immediately
+       resume the foreground poll in the same turn. Do not send a final
+       response until the poll returns `feedback` or `closed` — a final
+       response ends the turn and kills the wait.
+     - If your shell tool caps command duration, pass `--timeout` a little
+       under the cap and run bounded polls back to back in the same active
+       turn until one returns `feedback` or `closed`.
 
-4. Apply what comes back, then wait again. `--ack` clears the batch you just handled:
+     Know the limit: this is reliable only while your turn stays active. A
+     turn that has already ended is not woken when the user hits Send; the
+     user has to message you, and you then run `status` and `poll` to pick
+     the batch up. There is no integration that resumes an ended task when
+     the poll exits.
+
+   If it prints `{"status":"closed"}`, the review is over: the user ended it,
+   closed the tab, or never had one open (`reason` says which). Stop and do
+   not start another poll. `unsent` counts feedback they left behind; if it is
+   not zero, tell the user in one line that it is kept and they can restore or
+   discard it next time. `{"status":"superseded"}` means a newer poll of
+   yours owns the wait — stop this one silently. `{"status":"timeout"}` only
+   appears after 12 hours; run `status` and start the wait again if the
+   review is still open.
+
+4. Apply what comes back, then start the next background poll. `--ack` clears
+   the batch you just handled:
 
    ```sh
-   npx -y human-review poll path/to/file.html --ack --timeout 600
+   npx -y human-review poll path/to/file.html --ack
    ```
 
 Repeat 3–4 until the user says they are done.
 
-Not sure whether feedback is already waiting — say, at the start of a new turn?
-This answers instantly without blocking:
+Not sure whether feedback is already waiting — say, at the start of a new turn
+with no poll running? This answers instantly without blocking:
 
 ```sh
 npx -y human-review status path/to/file.html
@@ -72,6 +99,7 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   "pages": [
     {
       "file": "/abs/path/to/page.html",
+      "edits_saved": true,
       "comments": [
         { "id": "c_1", "kind": "selection", "quote": "the exact text they selected",
           "anchor": { "prefix": "...", "quote": "...", "suffix": "..." },
@@ -95,6 +123,16 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   carry it across verbatim and never revert it. If the HTML was generated from
   something else (MDX, Markdown, a template), apply `after` to the **source** too,
   or their fix disappears on the next build.
+- **`edits_saved: true` means those edits are already in the file on disk.**
+  Plain HTML files autosave as the user types, so your copy of the file is
+  stale. Re-read the file before touching it and make targeted changes only;
+  never regenerate it from what you wrote earlier, or their work disappears.
+  `edits_saved: false` (Markdown, localhost pages, self-rendering HTML) means the
+  edits exist only in this batch — apply them to the source yourself.
+- An edit with `kind: "deleted"` means the user removed that whole block:
+  delete it from the source too, without asking why.
+- An edit marked `truncated: true` had its text cut at 200k characters; read
+  the block from the page itself rather than from `after_html`.
 - When `before_html`/`after_html` are present, the user changed formatting, not
   just words — bold, italic, underline, links. Use the HTML version to carry the
   formatting into the source, translated to its syntax (e.g. `<strong>` → `**`
@@ -115,10 +153,16 @@ One batch covers every page the user visited, grouped by file or localhost URL.
 - An edit with `kind: "moved"` means the user relocated that whole block.
   Reposition it in the source without rewriting its content: it now sits right
   after the block whose text starts with `moved_after`, and right before the
-  block whose text starts with `moved_before`. An empty `moved_after` means it
-  is now the first block in its container.
-- Find each comment by its `quote`; that exact string is in the file.
+  block whose text starts with `moved_before` (both are clipped to 90
+  characters and may end in `…`). An empty `moved_after` means it is now the
+  first block in its container.
+- Find each comment by its `quote`. It is the **rendered** text the user
+  selected, so in Markdown or templated HTML it may span formatting syntax or
+  tags; `anchor.prefix` and `anchor.suffix` give the surrounding text to
+  disambiguate.
 - `kind: "element"` points at a whole block, so `quote` is its label, not body text.
+- Copy any `staged_assets` files before you ack: `--ack` deletes them.
+- A batch with only an `overall_note` has an empty `pages` array.
 - Fix every page in `pages`, not just the first.
 - **Do not write a reply.** There is no chat. The user sees your work when the page
   reloads, which happens on its own the moment you save the file.

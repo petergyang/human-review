@@ -12,7 +12,7 @@
       <iframe
         id="frame"
         title="Artifact under review"
-        sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"></iframe>
+        sandbox="allow-scripts allow-forms allow-modals"></iframe>
     </main>
 
     <button type="button" id="handle" class="handle" title="Hide comments panel" aria-label="Hide comments panel">›</button>
@@ -23,6 +23,14 @@
           <span class="section">Feedback</span>
           <span class="dim" id="count">0</span>
           <button type="button" id="theme" class="icon-btn" title="Switch chrome to dark" aria-label="Switch chrome to dark">☾</button>
+        </div>
+
+        <div id="leftover" class="leftover" hidden>
+          <p id="leftoverText"></p>
+          <div class="leftover-actions">
+            <button type="button" id="leftoverKeep" class="btn-ghost">Keep</button>
+            <button type="button" id="leftoverDiscard" class="btn-ghost danger-hover">Discard</button>
+          </div>
         </div>
 
         <div id="compose" hidden>

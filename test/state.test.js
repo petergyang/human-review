@@ -7,7 +7,7 @@ import path from "node:path";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "human-review-test-"));
 process.env.HUMAN_REVIEW_STATE_DIR = path.join(tmp, "state");
 
-const { Store, resolveAsset } = await import("../src/state.js");
+const { Store, atomicWrite, resolveAsset } = await import("../src/state.js");
 const { canonicalTarget, localUrl, targetKey } = await import("../src/paths.js");
 
 function page(name, body) {
@@ -23,6 +23,36 @@ test("openPage records the agent's version as the revert target", () => {
   assert.equal(opened.pristine, "<h1>v1</h1>");
   assert.deepEqual(opened.comments, []);
   assert.equal(store.pageForFile(file).key, opened.key);
+});
+
+test("the pristine copy lives in its own file, not in state.json, and a legacy inline copy migrates", () => {
+  const store = new Store();
+  const file = page("pristine.html", "<h1>big</h1>");
+  const big = `<h1>big</h1>${"<p>filler</p>".repeat(500)}`;
+  const { key } = store.openPage(file, big);
+  const stateFile = path.join(process.env.HUMAN_REVIEW_STATE_DIR, "state.json");
+  const raw = fs.readFileSync(stateFile, "utf8");
+  assert.doesNotMatch(raw, /filler/, "state.json no longer embeds whole documents");
+  const copy = path.join(process.env.HUMAN_REVIEW_STATE_DIR, "pristine", `${key}.html`);
+  assert.equal(fs.readFileSync(copy, "utf8"), big);
+  assert.equal(new Store().page(key).pristine, big, "a fresh store reads the copy back");
+
+  // An unchanged copy is not rewritten on every save.
+  const before = fs.statSync(copy).mtimeMs;
+  store.addComment(key, { id: "c1", kind: "selection", quote: "big", feedback: "x" });
+  assert.equal(fs.statSync(copy).mtimeMs, before);
+  store.setPristine(key, "<h1>v2</h1>");
+  assert.equal(fs.readFileSync(copy, "utf8"), "<h1>v2</h1>");
+
+  // A state.json written before this change still carries pristine inline.
+  const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  parsed.pages[key].pristine = "<h1>inline</h1>";
+  fs.writeFileSync(stateFile, JSON.stringify(parsed));
+  const legacy = new Store();
+  assert.equal(legacy.page(key).pristine, "<h1>inline</h1>");
+  legacy.addComment(key, { id: "c2", kind: "selection", quote: "big", feedback: "y" });
+  assert.doesNotMatch(fs.readFileSync(stateFile, "utf8"), /inline/, "the next save moves it out");
+  assert.equal(fs.readFileSync(copy, "utf8"), "<h1>inline</h1>");
 });
 
 test("reopening a page keeps its comments", () => {
@@ -159,5 +189,238 @@ test(
     assert.equal(resolveAsset(file, "style.css"), fs.realpathSync(path.join(dir, "style.css")));
   }
 );
+
+/**
+ * atomicWrite's retry lives behind the fs calls it makes, not behind an
+ * exported seam, so these tests swap those calls out and drive the real
+ * two-argument entry point. Atomics.wait stands in for the backoff: sleepSync
+ * is the only thing that calls it.
+ */
+const realRename = fs.renameSync;
+const realUnlink = fs.unlinkSync;
+const realWait = Atomics.wait;
+
+function withPatchedFs({ rename, unlink, wait }, fn) {
+  if (rename) fs.renameSync = rename;
+  if (unlink) fs.unlinkSync = unlink;
+  if (wait) Atomics.wait = wait;
+  try {
+    return fn();
+  } finally {
+    fs.renameSync = realRename;
+    fs.unlinkSync = realUnlink;
+    Atomics.wait = realWait;
+  }
+}
+
+const fail = (code) => {
+  const err = new Error(code + ": simulated");
+  err.code = code;
+  return err;
+};
+
+/** A rename that fails with `code` its first `times` calls, then succeeds. */
+function flakyRename(code, times) {
+  const calls = { count: 0 };
+  return {
+    calls,
+    rename: (from, to) => {
+      if (++calls.count <= times) throw fail(code);
+      return realRename(from, to);
+    },
+  };
+}
+
+/** Records the backoff without actually waiting, so the suite stays fast. */
+function recordWaits(slept) {
+  return (...args) => {
+    slept.push(args[3]);
+    return "timed-out";
+  };
+}
+
+const orphans = (dir) => fs.readdirSync(dir).filter((n) => n.endsWith(".human-review.tmp"));
+const scratch = (name) => fs.mkdtempSync(path.join(tmp, name));
+
+function capture(fn) {
+  try {
+    fn();
+  } catch (err) {
+    return err;
+  }
+  return undefined;
+}
+
+for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+  test("atomicWrite retries a " + code + " rename, which Windows scanners cause", () => {
+    const dir = scratch("retry-");
+    const file = path.join(dir, "state.json");
+    const { calls, rename } = flakyRename(code, 2);
+    const slept = [];
+
+    withPatchedFs({ rename, wait: recordWaits(slept) }, () => atomicWrite(file, "payload"));
+
+    assert.equal(fs.readFileSync(file, "utf8"), "payload");
+    assert.equal(calls.count, 3, "two failures then a success");
+    assert.deepEqual(slept, [1, 2], "backs off between attempts");
+    assert.deepEqual(orphans(dir), [], "no tmp file left behind");
+  });
+}
+
+test("atomicWrite gives up after a bounded number of retries", () => {
+  const dir = scratch("give-up-");
+  const file = path.join(dir, "state.json");
+  const { calls, rename } = flakyRename("EPERM", Infinity);
+  const slept = [];
+
+  const thrown = withPatchedFs({ rename, wait: recordWaits(slept) }, () =>
+    capture(() => atomicWrite(file, "payload"))
+  );
+
+  assert.equal(thrown?.code, "EPERM", "a truly stuck file still surfaces its error");
+  assert.equal(calls.count, 5, "bounded");
+  assert.deepEqual(slept, [1, 2, 4, 8], "no wait after the final attempt");
+  assert.equal(fs.existsSync(file), false);
+  assert.deepEqual(orphans(dir), [], "cleans up even when every attempt fails");
+});
+
+test("atomicWrite never retries an error that a retry cannot fix", () => {
+  const dir = scratch("fatal-");
+  const file = path.join(dir, "state.json");
+  const { calls, rename } = flakyRename("ENOSPC", Infinity);
+  const slept = [];
+
+  const thrown = withPatchedFs({ rename, wait: recordWaits(slept) }, () =>
+    capture(() => atomicWrite(file, "payload"))
+  );
+
+  assert.equal(thrown?.code, "ENOSPC");
+  assert.equal(calls.count, 1, "fails fast");
+  assert.deepEqual(slept, []);
+  assert.deepEqual(orphans(dir), []);
+});
+
+test("atomicWrite clears the temp file even when the unlink is blocked too", () => {
+  const dir = scratch("unlink-blocked-");
+  const file = path.join(dir, "state.json");
+  const { rename } = flakyRename("EPERM", Infinity);
+  const slept = [];
+
+  // The handle that blocks the rename blocks the unlink for just as long.
+  let unlinkCalls = 0;
+  const unlink = (target) => {
+    if (++unlinkCalls <= 2) throw fail("EPERM");
+    return realUnlink(target);
+  };
+
+  const thrown = withPatchedFs({ rename, unlink, wait: recordWaits(slept) }, () =>
+    capture(() => atomicWrite(file, "payload"))
+  );
+
+  assert.equal(thrown?.code, "EPERM");
+  assert.equal(unlinkCalls, 3, "keeps trying while the handle is held");
+  assert.deepEqual(orphans(dir), [], "nothing stranded in the state directory");
+  // The first four waits are the rename retries; the rest is cleanup backing
+  // off, so dropping that sleep would fail here.
+  assert.deepEqual(slept, [1, 2, 4, 8, 1, 2], "cleanup backs off as well");
+});
+
+test("cleanup exhaustion is bounded the same way the rename retry is", () => {
+  const dir = scratch("unlink-stuck-");
+  const file = path.join(dir, "state.json");
+  const { rename } = flakyRename("EPERM", Infinity);
+  const slept = [];
+
+  const cleanupFailure = fail("EPERM");
+  let unlinkCalls = 0;
+  const unlink = () => {
+    unlinkCalls++;
+    throw cleanupFailure;
+  };
+
+  const thrown = withPatchedFs({ rename, unlink, wait: recordWaits(slept) }, () =>
+    capture(() => atomicWrite(file, "payload"))
+  );
+
+  // Both errors carry EPERM, so only identity can tell them apart.
+  assert.ok(thrown, "the write failure has to reach the caller");
+  assert.notEqual(thrown, cleanupFailure, "the write error survives, not the cleanup error");
+  assert.equal(unlinkCalls, 5, "cleanup gives up after the same number of attempts");
+  assert.deepEqual(slept, [1, 2, 4, 8, 1, 2, 4, 8], "no wait after the final attempt");
+});
+
+test("a sleep that throws mid-retry cannot hijack the rename error", () => {
+  const dir = scratch("retry-sleep-throws-");
+  const file = path.join(dir, "state.json");
+  const { rename } = flakyRename("EPERM", Infinity);
+  const sleepFailure = new Error("sleep exploded");
+
+  // The very first wait belongs to the retry loop, so this covers the retry
+  // phase; the cleanup phase is covered below.
+  const thrown = withPatchedFs(
+    {
+      rename,
+      wait: () => {
+        throw sleepFailure;
+      },
+    },
+    () => capture(() => atomicWrite(file, "payload"))
+  );
+
+  assert.ok(thrown, "the write failure has to reach the caller");
+  assert.notEqual(thrown, sleepFailure, "a broken sleeper must not become the reported error");
+  assert.equal(thrown.code, "EPERM");
+  assert.deepEqual(orphans(dir), []);
+});
+
+test("a sleep that throws during cleanup cannot hijack the write error either", () => {
+  const dir = scratch("cleanup-sleep-throws-");
+  const file = path.join(dir, "state.json");
+  const { rename } = flakyRename("EPERM", Infinity);
+  const sleepFailure = new Error("sleep exploded");
+
+  // Cleanup is the only phase that calls unlink, so that marks the boundary.
+  let inCleanup = false;
+  const unlink = () => {
+    inCleanup = true;
+    throw fail("EPERM");
+  };
+
+  const thrown = withPatchedFs(
+    {
+      rename,
+      unlink,
+      wait: () => {
+        if (inCleanup) throw sleepFailure;
+        return "timed-out";
+      },
+    },
+    () => capture(() => atomicWrite(file, "payload"))
+  );
+
+  assert.ok(inCleanup, "the test has to actually reach the cleanup path");
+  assert.ok(thrown, "the write failure has to reach the caller");
+  assert.notEqual(thrown, sleepFailure, "a broken sleeper must not become the reported error");
+  assert.equal(thrown.code, "EPERM");
+});
+
+test("the backoff really sleeps, on Node's main thread", () => {
+  const dir = scratch("real-sleep-");
+  const file = path.join(dir, "state.json");
+  const { calls, rename } = flakyRename("EPERM", 3);
+
+  // Atomics.wait is left alone here, so this runs the real sleeper. Spying on
+  // it would prove it was called but not that it waited; elapsed time is the
+  // part a no-op cannot fake.
+  const started = process.hrtime.bigint();
+  withPatchedFs({ rename }, () => atomicWrite(file, "payload"));
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  assert.equal(fs.readFileSync(file, "utf8"), "payload");
+  assert.equal(calls.count, 4);
+  // Waits total 1 + 2 + 4 = 7ms; allow a little timer granularity, but stay
+  // far above the ~0ms a no-op or throwing sleeper would take.
+  assert.ok(elapsedMs >= 6, "expected a real delay, waited " + elapsedMs.toFixed(2) + "ms");
+});
 
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));

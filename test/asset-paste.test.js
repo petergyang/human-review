@@ -145,7 +145,7 @@ test("localhost image pastes are staged, previewed, and delivered to the agent",
   });
   assert.equal(pasted.status, 200, pasted.raw);
   const asset = JSON.parse(pasted.raw);
-  assert.equal(asset.src, `/artifact/${opened.key}/__human_review_paste__/localhost-paste-1.png`);
+  assert.equal(asset.src, `/artifact/${opened.artifactToken}/${opened.key}/__human_review_paste__/localhost-paste-1.png`);
   assert.equal(asset.stagedId, "localhost-paste-1.png");
   const stagedPath = path.join(process.env.HUMAN_REVIEW_STATE_DIR, "pasted", opened.key, asset.stagedId);
   assert.deepEqual(fs.readFileSync(stagedPath), PNG);

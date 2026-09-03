@@ -1,7 +1,30 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalTarget, ensureStateDir, pageKey, realFile, statePath, targetKey } from "./paths.js";
+import { canonicalTarget, ensureStateDir, pageKey, realFile, stateDir, statePath, targetKey } from "./paths.js";
+
+/**
+ * The agent's copy of each page is the revert target. It is whole documents,
+ * so it lives in its own file per page rather than inside state.json, which
+ * every edit flush rewrites in full.
+ */
+const pristineDir = () => path.join(stateDir(), "pristine");
+const pristinePath = (key) => path.join(pristineDir(), `${key}.html`);
+const digest = (text) => crypto.createHash("sha1").update(text).digest("hex");
+
+function readPristine(key) {
+  try {
+    return fs.readFileSync(pristinePath(key), "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function dropPristine(key) {
+  try {
+    fs.unlinkSync(pristinePath(key));
+  } catch {}
+}
 
 /** Anything untouched this long is review debris, not work in progress. */
 const PRUNE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -9,19 +32,95 @@ const PRUNE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const fresh = (entry, now) => !!entry && now - (entry.updatedAt || 0) < PRUNE_AGE_MS;
 
 /**
+ * Windows lets a virus scanner or indexer hold a brief handle on a file the
+ * moment it is created, and a rename against that handle fails with EPERM,
+ * EACCES or EBUSY. The handle is gone within a few milliseconds, so the write
+ * is not really lost -- it just has to be asked for again. Measured on a box
+ * running McAfee real-time protection, ~4% of renames failed on the first try
+ * and none survived a short backoff.
+ */
+const RETRYABLE_RENAME = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RENAME_TRIES = 5;
+
+/** Sleep without going async: atomicWrite is synchronous by contract. */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Drop the temp file after a failed write. The handle that blocked the rename
+ * blocks the unlink for exactly as long, so a single attempt would strand the
+ * file in the state directory -- and nothing else ever sweeps it. Give up
+ * quietly once the retries are spent: the caller is already throwing the error
+ * that matters, and a leftover temp file must not mask it.
+ */
+function discardTmp(tmp, unlink, sleep) {
+  try {
+    for (let attempt = 0; attempt < RENAME_TRIES; attempt++) {
+      try {
+        unlink(tmp);
+        return;
+      } catch (err) {
+        if (err.code === "ENOENT" || !RETRYABLE_RENAME.has(err.code)) return;
+        // Nothing waits on the last attempt: no attempt follows it.
+        if (attempt === RENAME_TRIES - 1) return;
+        sleep(2 ** attempt);
+      }
+    }
+  } catch {
+    // Best effort by definition. Whatever failed in here -- including the
+    // sleep -- must never escape and replace the write error the caller is
+    // already throwing.
+  }
+}
+
+/**
  * Atomic write via a unique sibling tmp file. The name is unguessable and the
  * create is exclusive, so a pre-planted symlink can never redirect the write,
  * and a failed rename never leaves a predictable orphan behind.
  */
 export function atomicWrite(file, data) {
+  return writeThroughTmp(file, data, REAL);
+}
+
+/**
+ * The real calls, looked up at call time rather than captured here, so a test
+ * can drive the exported atomicWrite through its retry by patching fs.
+ */
+const REAL = {
+  rename: (from, to) => fs.renameSync(from, to),
+  unlink: (target) => fs.unlinkSync(target),
+  sleep: (ms) => sleepSync(ms),
+};
+
+/**
+ * atomicWrite's body. Private: nothing outside this module may hand it a
+ * rename that quietly does nothing and reports a successful write. Tests
+ * reach the retry by patching fs, which REAL looks up at call time.
+ */
+function writeThroughTmp(file, data, overrides) {
+  // Merged per key, so a test can replace one call and still exercise the
+  // real implementations of the others.
+  const { rename, unlink, sleep } = { ...REAL, ...overrides };
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.human-review.tmp`;
   fs.writeFileSync(tmp, data, { flag: "wx" });
   try {
-    fs.renameSync(tmp, file);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        rename(tmp, file);
+        return;
+      } catch (err) {
+        if (attempt >= RENAME_TRIES - 1 || !RETRYABLE_RENAME.has(err.code)) throw err;
+        try {
+          sleep(2 ** attempt);
+        } catch {
+          // A broken sleeper is not the failure worth reporting.
+          throw err;
+        }
+      }
+    }
   } catch (err) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {}
+    discardTmp(tmp, unlink, sleep);
     throw err;
   }
 }
@@ -31,8 +130,8 @@ export function atomicWrite(file, data) {
  *
  * Shape:
  *   {
- *     pages:   { <key>: { key, file, pristine, comments[], edits[], updatedAt } },
- *     batches: { <entryKey>: { batch, cleanup, updatedAt } },
+ *     pages:   { <key>: { key, file, pristine, dynamic, comments[], edits[], updatedAt } },
+ *     batches: { <entryKey>: { batch, cleanup, delivered, priorCleanup, updatedAt } },
  *   }
  *
  * Pages are fully independent: no page ever references another. Batches are
@@ -44,6 +143,8 @@ export class Store {
     this.data = { pages: {}, batches: {} };
     /** Batches this process acked; save() must not resurrect them from disk. */
     this.clearedBatches = new Set();
+    /** Digest of the pristine copy already on disk per page; unchanged copies are not rewritten. */
+    this.pristineWritten = new Map();
     this.load();
   }
 
@@ -57,6 +158,13 @@ export class Store {
     } catch {
       // Missing or unreadable state is not an error; start empty.
     }
+    for (const [key, page] of Object.entries(this.data.pages)) {
+      // A state file from before pristine copies moved out still embeds
+      // them; that copy is kept and lands in its own file on the next save.
+      if (typeof page.pristine === "string") continue;
+      page.pristine = readPristine(key);
+      if (page.pristine) this.pristineWritten.set(key, digest(page.pristine));
+    }
     this.prune();
     return this.data;
   }
@@ -69,6 +177,7 @@ export class Store {
       if (!fresh(page, now) || missingFile) {
         delete this.data.pages[key];
         delete this.data.batches[key];
+        dropPristine(key);
       }
     }
     for (const [key, batch] of Object.entries(this.data.batches)) {
@@ -91,15 +200,29 @@ export class Store {
     } catch {
       // No readable state yet; ours becomes the file.
     }
+    const stripped = {};
+    for (const [key, page] of Object.entries(this.data.pages)) {
+      const { pristine, ...rest } = page;
+      stripped[key] = rest;
+      if (typeof pristine !== "string" || !pristine) continue;
+      const hash = digest(pristine);
+      if (this.pristineWritten.get(key) === hash) continue;
+      fs.mkdirSync(pristineDir(), { recursive: true });
+      atomicWrite(pristinePath(key), pristine);
+      this.pristineWritten.set(key, hash);
+    }
     const merged = {
-      pages: { ...onDisk.pages, ...this.data.pages },
+      pages: { ...onDisk.pages, ...stripped },
       batches: { ...onDisk.batches, ...this.data.batches },
     };
     for (const key of this.clearedBatches) delete merged.batches[key];
     // Age-prune the merged result too, so the file cannot grow without bound.
     const now = Date.now();
     for (const [key, page] of Object.entries(merged.pages)) {
-      if (!fresh(page, now)) delete merged.pages[key];
+      if (!fresh(page, now)) {
+        delete merged.pages[key];
+        dropPristine(key);
+      }
     }
     for (const [key, batch] of Object.entries(merged.batches)) {
       if (!fresh(batch, now)) delete merged.batches[key];
@@ -189,17 +312,51 @@ export class Store {
     });
   }
 
-  /** Rewording feedback before it is sent. Returns null for an unknown id. */
-  updateComment(key, id, feedback) {
+  /**
+   * Reword feedback. A comment the agent already received keeps the old id in
+   * that batch's cleanup, so the reworded one takes a fresh id (`newId`) and
+   * survives the ack to ship with the next Send. Returns null for an unknown id.
+   */
+  updateComment(key, id, feedback, { newId = "" } = {}) {
     let found = false;
     const page = this.update(key, (p) => {
       const comment = p.comments.find((c) => c.id === id);
       if (comment) {
         comment.feedback = feedback;
+        comment.updatedAt = Date.now();
+        if (newId) comment.id = newId;
         found = true;
       }
     });
     return found ? page : null;
+  }
+
+  /** Undo of a delete or move: the row for that block no longer describes anything. */
+  removeEdit(key, label, kind) {
+    return this.update(key, (page) => {
+      page.edits = page.edits.filter((e) => !(e.label === label && e.kind === kind));
+    });
+  }
+
+  /** The user abandoned leftover feedback from an earlier review of this page. */
+  discardFeedback(key) {
+    return this.update(key, (page) => {
+      page.comments = [];
+      page.edits = [];
+    });
+  }
+
+  /**
+   * A self-rendering HTML file: its scripts rewrite the DOM, so browser edits
+   * are feedback only and never on disk. Remembered so the batch can say so.
+   */
+  setDynamic(key, dynamic) {
+    const page = this.page(key);
+    if (!page || !!page.dynamic === !!dynamic) return page;
+    return this.update(key, (p) => {
+      if (dynamic) p.dynamic = true;
+      else delete p.dynamic;
+    });
   }
 
   /**
@@ -233,11 +390,16 @@ export class Store {
     });
   }
 
-  /** After the agent writes, its version becomes the new revert target. */
-  setPristine(key, html) {
+  /**
+   * After the agent writes, its version becomes the new revert target. Edit
+   * rows are dropped only when they were already written into the file: on a
+   * Markdown or self-rendering page they are unsent feedback, and an external
+   * write (an editor autosave, a formatter) must not throw them away.
+   */
+  setPristine(key, html, { keepEdits = false } = {}) {
     return this.update(key, (page) => {
       page.pristine = html;
-      page.edits = [];
+      if (!keepEdits) page.edits = [];
     });
   }
 
@@ -266,10 +428,44 @@ export class Store {
     return this.data.batches;
   }
 
-  setBatch(entryKey, { batch, cleanup }) {
+  setBatch(entryKey, { batch, cleanup, delivered = false, priorCleanup = null }) {
     this.clearedBatches.delete(entryKey);
-    this.data.batches[entryKey] = { batch, cleanup, updatedAt: Date.now() };
+    this.data.batches[entryKey] = {
+      batch,
+      cleanup,
+      delivered: !!delivered,
+      ...(priorCleanup && priorCleanup.length ? { priorCleanup } : {}),
+      updatedAt: Date.now(),
+    };
     this.save();
+  }
+
+  /**
+   * Delivery is durable: a server replaced between handing a batch out and
+   * the agent's --ack must still honor that ack, not ship the batch twice.
+   */
+  markDelivered(entryKey) {
+    const record = this.data.batches[entryKey];
+    if (!record || record.delivered) return;
+    record.delivered = true;
+    record.updatedAt = Date.now();
+    this.save();
+  }
+
+  /**
+   * A batch another server process wrote (two servers briefly overlapping)
+   * lives only on disk. Read it fresh so a poll here can still deliver it.
+   */
+  batchFromDisk(entryKey) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(statePath(), "utf8"));
+      const record = parsed && parsed.batches ? parsed.batches[entryKey] : null;
+      if (!record || this.clearedBatches.has(entryKey)) return null;
+      this.data.batches[entryKey] = record;
+      return record;
+    } catch {
+      return null;
+    }
   }
 
   clearBatch(entryKey) {

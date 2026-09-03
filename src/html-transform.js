@@ -4,12 +4,26 @@ const SDK_TAG_RE = /<script[^>]*\bdata-eh-sdk\b[^>]*><\/script>/gi;
 const SDK_BASE_RE = /<base[^>]*\bdata-eh-sdk\b[^>]*>/gi;
 const SDK_ROUTE_RE = /<script[^>]*\bdata-eh-route\b[^>]*>[\s\S]*?<\/script>/gi;
 const ASSET_TAG_RE = /<(script|link|img|source|video|audio|iframe|embed|object)\b[^>]*>/gi;
-const ASSET_ATTR_RE = /(\s)(src|href|poster|data)=(['"])(.*?)\3/gi;
+const ASSET_ATTR_RE = /(\s)(src|href|poster|data|srcset)=(['"])(.*?)\3/gi;
+
+const skipUrl = (value) => !value || /^(?:data|blob|javascript):/i.test(value) || value.startsWith("#");
 
 function absolutizeAssets(html, baseHref) {
   return String(html).replace(ASSET_TAG_RE, (tag) =>
     tag.replace(ASSET_ATTR_RE, (attribute, space, name, quote, value) => {
-      if (!value || /^(?:data|blob|javascript):/i.test(value) || value.startsWith("#")) return attribute;
+      if (name.toLowerCase() === "srcset") {
+        // "a.png 1x, b.png 2x": each candidate is a URL followed by a descriptor.
+        const rewritten = value
+          .split(",")
+          .map((candidate) => {
+            const [url, ...descriptor] = candidate.trim().split(/\s+/);
+            if (skipUrl(url)) return candidate.trim();
+            return [new URL(url, baseHref).href, ...descriptor].join(" ");
+          })
+          .join(", ");
+        return `${space}${name}=${quote}${rewritten}${quote}`;
+      }
+      if (skipUrl(value)) return attribute;
       const absolute = new URL(value, baseHref).href;
       return `${space}${name}=${quote}${absolute}${quote}`;
     })

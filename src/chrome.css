@@ -454,3 +454,33 @@ body.collapsed .handle { right: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, .rail, .handle { animation: none !important; transition: none !important; }
 }
+
+/* An undo-able action: the toast carries the button. */
+.toast-action {
+  margin-left: 12px;
+  padding: 3px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.toast-action:hover { background: rgba(255, 255, 255, 0.14); }
+:root[data-theme="dark"] .toast-action { border-color: rgba(0, 0, 0, 0.25); }
+:root[data-theme="dark"] .toast-action:hover { background: rgba(0, 0, 0, 0.1); }
+
+/* Feedback left behind by a review that ended without a Send. */
+.leftover {
+  margin: 10px 12px 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--strong-border);
+  border-radius: 9px;
+  background: var(--soft);
+}
+.leftover p { margin: 0 0 8px; font-size: 12px; line-height: 1.45; color: var(--txt); }
+.leftover-actions { display: flex; gap: 6px; }
+.leftover-actions .btn-ghost { padding: 4px 10px; font-size: 12px; }
+
+.edit-comment { margin-left: 0; }

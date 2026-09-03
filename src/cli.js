@@ -13,9 +13,9 @@ const pkg = JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "u
 const HELP = `human-review ${pkg.version}
 
   human-review <file-or-localhost-url> Open a file or localhost page for review
-  human-review poll <target>          Wait for feedback, print it as JSON (for agents)
-      --ack                        Acknowledge the last batch, then keep waiting
-      --timeout <secs>             Exit with {"status":"timeout"} if nothing arrives
+  human-review poll <target>          Block until the user hits Send, then print the batch as JSON
+      --ack                        Acknowledge the last batch, then wait for the next
+      --timeout <secs>             Give up with {"status":"timeout"} after this long (default: wait for Send)
   human-review status <target>        Report whether feedback is waiting, without blocking
   human-review setup                  Teach Claude Code / Codex how to use human-review
   human-review setup --global         ...for every project, not just this one
@@ -119,7 +119,7 @@ async function openCommand(input) {
   openBrowser(url);
   console.log(`Reviewing ${target.kind === "url" ? target.value : path.basename(target.value)}`);
   console.log(url);
-  console.log(`\nWaiting for feedback? Run:\n  human-review poll ${shellQuote(target.value)}`);
+  console.log(`\nWaiting for feedback? Run this in the background; it exits when the user hits Send:\n  human-review poll ${shellQuote(target.value)}`);
 }
 
 /**
@@ -151,6 +151,11 @@ function pollOnce(server, target, ack, timeoutMs) {
           raw += chunk;
         });
         res.on("end", () => settle(resolve, { kind: "data", raw: raw.trim() }));
+        res.on("error", (err) => settle(reject, err));
+        // The server went away mid-wait: the socket closes without an 'end'.
+        // Left unhandled, the promise never settles and Node exits the
+        // process as soon as the loop drains — with the agent still asleep.
+        res.on("close", () => settle(reject, new Error("server connection closed")));
       }
     );
     const timer = timeoutMs
@@ -173,43 +178,76 @@ function writeStdout(text) {
   return new Promise((resolve) => process.stdout.write(text, resolve));
 }
 
-function printTimeout(waitedSecs) {
+/** An open-ended wait still ends eventually: a forgotten tab must not pin a process for days. */
+const MAX_OPEN_WAIT_MS = 12 * 60 * 60 * 1000;
+
+function printTimeout(waitedSecs, { capped = false } = {}) {
   const payload = {
     status: "timeout",
     waited_seconds: waitedSecs,
-    next_step:
-      "No feedback yet. Run the same poll command again to keep waiting, or `human-review status <target>` to check without blocking.",
+    next_step: capped
+      ? "Nothing arrived in 12 hours. Run `human-review status <target>`: if the review is still open, start the same background poll again; otherwise stop."
+      : "No feedback yet. Run the same poll command again to keep waiting, or `human-review status <target>` to check without blocking.",
   };
   return writeStdout(`${JSON.stringify(payload, null, 2)}\n`);
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Without --timeout this is an open-ended wait: the agent parks this process
+ * in the background and is woken only when it exits, which should happen
+ * when the user hits Send or closes the review — never because the detached
+ * server went away underneath it (a newer CLI replaced it, or the machine
+ * slept). So a lost connection reconnects, restarting the server if needed,
+ * instead of giving up. A poll with a deadline keeps the old bounded retries.
+ */
 async function pollCommand(input, { ack = false, timeoutSecs = 0 } = {}) {
   const target = canonicalTarget(input).value;
-  const server = await ensureServer();
+  let server = await ensureServer();
 
   const label = /^https?:\/\//i.test(target) ? target : path.basename(target);
   process.stderr.write(`Waiting for feedback on ${label} — comment in the browser, then hit Send.\n`);
 
-  const deadline = timeoutSecs ? Date.now() + timeoutSecs * 1000 : null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const remaining = deadline ? deadline - Date.now() : 0;
-    if (deadline && remaining <= 0) return printTimeout(timeoutSecs);
+  const bounded = timeoutSecs > 0;
+  const started = Date.now();
+  const deadline = bounded ? started + timeoutSecs * 1000 : started + MAX_OPEN_WAIT_MS;
+  const timedOut = () => printTimeout(bounded ? timeoutSecs : Math.round((Date.now() - started) / 1000), { capped: !bounded });
+  // The ack rides on the first request that actually reaches the server.
+  let ackPending = ack;
+  let failures = 0;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return timedOut();
     let result;
     try {
-      result = await pollOnce(server, target, ack && attempt === 0, remaining);
+      result = await pollOnce(server, target, ackPending, remaining);
     } catch (err) {
-      process.stderr.write(`Lost the connection (${err.message}); retrying.\n`);
+      failures += 1;
+      if (bounded && failures >= 3) break;
+      process.stderr.write(`Lost the connection (${err.message}); reconnecting.\n`);
+      // Long enough for a replacement server to announce itself first, so
+      // this does not race it by spawning a second one.
+      await sleep(Math.min(3000 * failures, 10000));
+      server = await ensureServer();
       continue;
     }
-    if (result.kind === "timeout") return printTimeout(timeoutSecs);
-    if (!result.raw) continue;
-    try {
-      const batch = JSON.parse(result.raw);
-      await writeStdout(`${JSON.stringify(batch, null, 2)}\n`);
-      return;
-    } catch {
-      process.stderr.write("Unexpected response from the human-review server; retrying.\n");
+    ackPending = false;
+    if (result.kind === "timeout") return timedOut();
+    if (result.raw) {
+      try {
+        const batch = JSON.parse(result.raw);
+        await writeStdout(`${JSON.stringify(batch, null, 2)}\n`);
+        return;
+      } catch {
+        process.stderr.write("Unexpected response from the human-review server; retrying.\n");
+      }
     }
+    // An empty or garbled answer means the server closed the request without
+    // a batch; wait a beat so a misbehaving server cannot spin this loop.
+    failures += 1;
+    if (bounded && failures >= 3) break;
+    await sleep(500);
   }
   process.stderr.write("Gave up waiting for feedback.\n");
   process.exit(1);
