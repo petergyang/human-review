@@ -371,7 +371,7 @@ const pinnedLabels = new WeakMap();
  */
 const bootChildren = new WeakMap();
 function snapshotOrder() {
-  for (const el of document.body.querySelectorAll("*")) {
+  for (const el of [document.body, ...document.body.querySelectorAll("*")]) {
     if (el.children.length > 1 && !isOurs(el)) bootChildren.set(el, [...el.children]);
   }
 }
