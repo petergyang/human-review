@@ -994,9 +994,14 @@ export function createServer() {
 
         // Leftover feedback from an earlier review the user chose not to keep.
         if (action === "discard" && req.method === "POST") {
+          const page = store.page(key);
+          // On a plain HTML file the edits were autosaved into it; discarding
+          // them means putting the agent's version back, not just dropping rows.
+          const reverted = page.kind !== "url" && !isMarkdown(page.file) && !page.dynamic && !!page.pristine;
+          if (reverted) writePage(key, page.pristine);
           store.discardFeedback(key);
-          for (const session of sessionsForKey(key)) emit(session, "refresh", {});
-          return json(res, 200, { page: pageState(key) });
+          for (const session of sessionsForKey(key)) emit(session, reverted ? "reload" : "refresh", reverted ? { key } : {});
+          return json(res, 200, { page: pageState(key), reverted });
         }
 
         // File reviews keep pasted images beside the document. Localhost

@@ -392,7 +392,7 @@ function render() {
     const parts = [];
     if (leftover.comments) parts.push(`${leftover.comments} ${leftover.comments === 1 ? "comment" : "comments"}`);
     if (leftover.edits) parts.push(`${leftover.edits} ${leftover.edits === 1 ? "edit" : "edits"}`);
-    const savedNote = page.kind === "file" && !page.markdown ? " Text edits are already in the file either way." : "";
+    const savedNote = page.kind === "file" && !page.markdown ? " Text edits are already in the file; Discard puts the agent's version back." : "";
     $("leftoverText").textContent = `${parts.join(" and ")} from your last review never went to the agent.${savedNote}`;
   }
 

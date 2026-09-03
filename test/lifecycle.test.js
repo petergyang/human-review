@@ -295,12 +295,25 @@ test("undo removes the edit row; discard clears leftover feedback", async (t) =>
   assert.deepEqual(page.edits.map((e) => e.label), ["p 2"]);
   await comment(port, token, opened.key, "Beta", "Old thought");
 
-  // A later open reports what was left behind, and discard wipes it.
+  // A later open reports what was left behind, and discard wipes it — and on
+  // an HTML file, whose edits were autosaved, restores the agent's version.
+  // The browser autosaves through the save route, so the file changes while
+  // the agent's version stays the revert target.
+  const raw = j(await request(port, token, { route: `/api/page/${opened.key}/raw` }));
+  await request(port, token, {
+    method: "POST",
+    route: `/api/page/${opened.key}/save`,
+    body: { html: "<!DOCTYPE html>\n<html><head></head><body><p>Gamma</p></body></html>\n", baseHash: raw.hash },
+  });
+  assert.match(fs.readFileSync(file, "utf8"), /Gamma/);
   const reopened = await open(port, token, file);
   assert.deepEqual(reopened.leftover, { comments: 1, edits: 1 });
-  page = j(await request(port, token, { method: "POST", route: `/api/page/${opened.key}/discard` })).page;
+  const discarded = j(await request(port, token, { method: "POST", route: `/api/page/${opened.key}/discard` }));
+  page = discarded.page;
   assert.deepEqual(page.comments, []);
   assert.deepEqual(page.edits, []);
+  assert.equal(discarded.reverted, true);
+  assert.match(fs.readFileSync(file, "utf8"), /<p>Alpha<\/p>/, "the file is back to the agent's version");
   const fresh = await open(port, token, file);
   assert.deepEqual(fresh.leftover, { comments: 0, edits: 0 });
 });
