@@ -97,6 +97,39 @@ A page with \`edits_saved: true\` already has those edits on disk: re-read the
 file and make targeted changes only, never regenerate it from an older copy.
 `;
 
+const BLOCK_START = "<!-- human-review:start -->";
+const BLOCK_END = "<!-- human-review:end -->";
+/** The heading an older setup wrote, before the block carried markers. */
+const LEGACY_HEADING = "## Reviewing files and localhost pages with human-review";
+
+/**
+ * Put the current Codex block into AGENTS.md, replacing whatever an earlier
+ * setup left there. Instructions in this file used to be written once and
+ * never touched again, so projects set up months ago kept telling Codex to
+ * do things the tool no longer does. Marker comments make the block ours
+ * to rewrite; a project that mentions human-review in its own words is left
+ * alone.
+ */
+export function mergeAgentsBlock(existing, block) {
+  const marked = `${BLOCK_START}\n${block.trim()}\n${BLOCK_END}\n`;
+  if (!existing) return { text: marked, action: "created" };
+  const start = existing.indexOf(BLOCK_START);
+  const end = existing.indexOf(BLOCK_END, start === -1 ? 0 : start);
+  if (start !== -1 && end !== -1) {
+    const tail = existing.slice(end + BLOCK_END.length).replace(/^\n/, "");
+    const text = `${existing.slice(0, start)}${marked}${tail}`;
+    return { text, action: text === existing ? "current" : "updated" };
+  }
+  const head = existing.indexOf(LEGACY_HEADING);
+  if (head !== -1) {
+    const next = existing.indexOf("\n## ", head + LEGACY_HEADING.length);
+    const stop = next === -1 ? existing.length : next + 1;
+    return { text: `${existing.slice(0, head)}${marked}${existing.slice(stop)}`, action: "updated" };
+  }
+  if (existing.includes("human-review")) return { text: existing, action: "custom" };
+  return { text: `${existing.trimEnd()}\n\n${marked}`, action: "updated" };
+}
+
 export function installSkills(cwd, { global: isGlobal = false, home = os.homedir() } = {}) {
   const done = [];
   const cmd = invocation();
@@ -119,12 +152,12 @@ export function installSkills(cwd, { global: isGlobal = false, home = os.homedir
   if (!isGlobal) {
     const agents = path.join(cwd, "AGENTS.md");
     const existing = fs.existsSync(agents) ? fs.readFileSync(agents, "utf8") : "";
-    if (existing.includes("human-review")) {
-      done.push("AGENTS.md already mentions human-review — left it alone");
-    } else {
-      const block = CODEX_BLOCK.replaceAll("npx -y human-review", cmd);
-      fs.writeFileSync(agents, existing ? `${existing.trimEnd()}\n${block}` : block.trimStart());
-      done.push(`${existing ? "Updated" : "Created"} AGENTS.md   (Codex)`);
+    const { text, action } = mergeAgentsBlock(existing, CODEX_BLOCK.replaceAll("npx -y human-review", cmd));
+    if (action === "custom") done.push("AGENTS.md mentions human-review in its own words — left it alone");
+    else if (action === "current") done.push("AGENTS.md already current   (Codex)");
+    else {
+      fs.writeFileSync(agents, text);
+      done.push(`${action === "created" ? "Created" : "Updated"} AGENTS.md   (Codex)`);
     }
   }
 
