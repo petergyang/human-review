@@ -43,13 +43,23 @@ keeping its formatting syntax.
 
    - **Claude Code:** run it with `run_in_background: true` and end your turn.
      Claude Code wakes you with the output the moment the command exits.
-   - **Codex, Cursor, and everything else:** run it in the **foreground** and
-     stay on it until it exits. Do not detach it or start it as a background
-     session — nothing will wake you when a detached command finishes, and
-     the user's Send will sit unread until they nudge you. If your shell tool
-     enforces a maximum command duration, pass `--timeout` a little under
-     that limit and run the same command again when it prints
-     `{"status":"timeout"}`.
+   - **Codex, Cursor, and everything else:** run it in the **foreground**,
+     inside your active turn, and stay on it until it prints `feedback` or
+     `closed`. Do not detach it or start it as a background session: nothing
+     wakes you when a detached command finishes. While the review is active:
+     - If the user sends a message, answer it as commentary and immediately
+       resume the foreground poll in the same turn. Do not send a final
+       response until the poll returns `feedback` or `closed` — a final
+       response ends the turn and kills the wait.
+     - If your shell tool caps command duration, pass `--timeout` a little
+       under the cap and run bounded polls back to back in the same active
+       turn until one returns `feedback` or `closed`.
+
+     Know the limit: this is reliable only while your turn stays active. A
+     turn that has already ended is not woken when the user hits Send; the
+     user has to message you, and you then run `status` and `poll` to pick
+     the batch up. There is no integration that resumes an ended task when
+     the poll exits.
 
    If it prints `{"status":"closed"}`, the review is over: the user ended it,
    closed the tab, or never had one open (`reason` says which). Stop and do

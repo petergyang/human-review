@@ -65,14 +65,19 @@ After writing an HTML or Markdown file the user will read, open it for them with
 \`npx -y human-review <file.html>\`. For a locally running web page, open the real
 route with \`npx -y human-review http://localhost:3000/path\` instead of recreating
 it as a static file. Then run
-\`npx -y human-review poll <target>\` in the foreground and stay on it: it
-blocks until the user hits Send, prints the \`{"status":"feedback"}\` batch,
-and exits. Do not detach it or start it as a background session — nothing
-wakes you when a detached command finishes, so the user's Send would sit
-unread. Do not poll on an interval. If your shell tool enforces a maximum
-command duration, pass \`--timeout\` a little under that limit and run the
-same command again on \`{"status":"timeout"}\`. Apply the batch, then run
-the poll again with \`--ack\`.
+\`npx -y human-review poll <target>\` in the foreground, inside your active
+turn, and stay on it until it prints \`{"status":"feedback"}\` or
+\`{"status":"closed"}\`. Do not detach it or start it as a background
+session: nothing wakes you when a detached command finishes. While the review
+is active, answer any incoming user message as commentary and immediately
+resume the foreground poll in the same turn; do not send a final response
+until the poll returns feedback or closed, because a final response ends the
+turn and kills the wait. If your shell tool caps command duration, pass
+\`--timeout\` a little under the cap and run bounded polls back to back in
+the same active turn. Apply the batch, then run the poll again with
+\`--ack\`. This is reliable only while the turn stays active: a turn that
+already ended is not woken by Send, and the user has to message you, after
+which \`status\` and \`poll\` pick the batch up.
 \`{"status":"closed"}\` means the review is over (ended, tab closed, or none
 open); do not poll again, and if its \`unsent\` counts are not zero, tell the user
 in one line. \`{"status":"superseded"}\` means a newer poll of yours owns the
