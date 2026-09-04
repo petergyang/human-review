@@ -1494,6 +1494,10 @@ function boot() {
     const target = targetFor(el);
     moving = { el, label: target ? target.label : "Block", drop: null, pointer: { x: event.clientX, y: event.clientY } };
     captureOriginal(moving.el);
+    // Dimming the block is our doing, not the page rendering itself: say so
+    // before touching it, or a move as the first action reads as self-render
+    // and switches saves off for the rest of the review.
+    userEdited = true;
     moving.el.style.opacity = "0.4";
     place(els.outline, null);
     showChip(null);
