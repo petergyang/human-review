@@ -294,6 +294,18 @@ function render() {
       kind.className = "kind";
       kind.textContent = edit.kind;
       row.append(pip, label, kind);
+      if (edit.kind === "deleted" || edit.kind === "moved") {
+        const undo = document.createElement("button");
+        undo.type = "button";
+        undo.className = "row-undo";
+        undo.textContent = "Undo";
+        undo.title = edit.kind === "moved" ? "Put this block back where it was" : "Restore this block";
+        undo.addEventListener("click", (event) => {
+          event.stopPropagation();
+          undoBlock(edit.label, edit.kind);
+        });
+        row.append(undo);
+      }
       rows.append(row);
     }
     if (edits.length > LIMIT) {
@@ -507,8 +519,12 @@ function toast(message, { action = "", onAction = null, ms = 3200 } = {}) {
  */
 let editChain = Promise.resolve();
 
+/** Ask the editor to put the block back; the row is dropped once it confirms (eh:undone). */
 function undoBlock(label, kind) {
   toFrame({ type: "eh:undo", label, kind });
+}
+
+function dropEditRow(label, kind) {
   editChain = editChain.then(async () => {
     try {
       state.page = (await api(`/api/page/${state.key}/edit`, { method: "DELETE", body: JSON.stringify({ label, kind }) })).page;
@@ -678,11 +694,18 @@ window.addEventListener("message", async (event) => {
       await editChain.catch((err) => toast(err.message));
       break;
     case "eh:undoable":
-      toast(msg.kind === "moved" ? `Moved “${tidy(msg.label, 40)}”` : `Deleted “${tidy(msg.label, 40)}”`, {
+      toast(msg.kind === "moved" ? `Moved “${tidy(msg.label, 40)}” — ⌘Z or Undo to put it back` : `Deleted “${tidy(msg.label, 40)}” — ⌘Z or Undo to restore`, {
         action: "Undo",
         ms: 8000,
         onAction: () => undoBlock(msg.label, msg.kind),
       });
+      break;
+    case "eh:undone":
+      document.querySelectorAll(".toast").forEach((el) => el.remove());
+      dropEditRow(String(msg.label || ""), String(msg.kind || ""));
+      break;
+    case "eh:undoFailed":
+      toast(msg.kind === "moved" ? "Can't put that one back after a reload — drag it where you want it" : "Can't restore that one after a reload");
       break;
     case "eh:asset":
       try {

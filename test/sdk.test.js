@@ -71,6 +71,39 @@ test("deleting a block reports it, offers undo, and undo restores it", { skip },
   fromChrome({ type: "eh:undo", label: "Plan · p 2", kind: "deleted" });
   const texts = [...document.querySelectorAll("p")].map((p) => p.textContent);
   assert.deepEqual(texts, ["Keep me.", "Delete me.", "Closing."], "the block is back where it was");
+  assert.ok(posts.some((m) => m.type === "eh:undone" && m.label === "Plan · p 2"), "the chrome is told so it can drop the row");
+
+  // Nothing left to restore under that label: the chrome hears that too.
+  fromChrome({ type: "eh:undo", label: "Plan · p 2", kind: "deleted" });
+  assert.ok(posts.some((m) => m.type === "eh:undoFailed"));
+});
+
+test("older deletes stay restorable, and ⌘Z undoes the latest one unless typing came after", { skip }, async () => {
+  const { window, document, posts, fromChrome, shadow } = await bootSdk("<h1>Plan</h1><p>One.</p><p>Two.</p><p>Three.</p>");
+  const [one, two, three] = document.querySelectorAll("p");
+  for (const p of [one, two]) {
+    p.dispatchEvent(new window.MouseEvent("mouseover", { bubbles: true }));
+    shadow.getElementById("chipDelete").click();
+  }
+  assert.deepEqual([...document.querySelectorAll("p")].map((p) => p.textContent), ["Three."]);
+
+  // The first deletion, not the most recent, restores from the edit list.
+  fromChrome({ type: "eh:undo", label: "Plan · p 1", kind: "deleted" });
+  assert.deepEqual([...document.querySelectorAll("p")].map((p) => p.textContent), ["One.", "Three."]);
+
+  // ⌘Z right after the remaining deletion brings the second one back.
+  document.body.dispatchEvent(new window.KeyboardEvent("keydown", { key: "z", metaKey: true, bubbles: true, cancelable: true }));
+  assert.deepEqual([...document.querySelectorAll("p")].map((p) => p.textContent), ["One.", "Two.", "Three."]);
+
+  // After typing, ⌘Z is the browser's own undo again: nothing of ours moves.
+  three.dispatchEvent(new window.MouseEvent("mouseover", { bubbles: true }));
+  shadow.getElementById("chipDelete").click();
+  one.dispatchEvent(new window.Event("input", { bubbles: true }));
+  const zed = new window.KeyboardEvent("keydown", { key: "z", metaKey: true, bubbles: true, cancelable: true });
+  document.body.dispatchEvent(zed);
+  assert.equal(zed.defaultPrevented, false);
+  assert.deepEqual([...document.querySelectorAll("p")].map((p) => p.textContent), ["One.", "Two."]);
+  assert.equal(posts.filter((m) => m.type === "eh:undone").length, 2);
 });
 
 test("typing over a selection that spans blocks reports every block it touched", { skip }, async () => {
