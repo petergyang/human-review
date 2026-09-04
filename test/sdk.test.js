@@ -12,6 +12,8 @@ const skip = JSDOM ? false : "jsdom unavailable on this Node version";
 
 const CHROME_ORIGIN = "http://localhost:4000";
 let seq = 0;
+/** The most recent boot, so its pending timers can be flushed before the next one takes the globals. */
+let current = null;
 
 /**
  * Boot the editor SDK against a jsdom document standing in for the review
@@ -21,6 +23,13 @@ let seq = 0;
  * query so module-level state starts fresh.
  */
 async function bootSdk(body) {
+  // Every instance posts through the global `parent`. An edit still sitting in
+  // a previous instance's flush timer would land in this test's capture, so
+  // drain it while the old window is still the global one.
+  if (current) {
+    current.fromChrome({ type: "eh:flush" });
+    current = null;
+  }
   const dom = new JSDOM(`<!DOCTYPE html><html><head></head><body>${body}</body></html>`, {
     url: "http://127.0.0.1:4000/artifact/t/k/index.html",
     pretendToBeVisual: true,
@@ -58,6 +67,7 @@ async function bootSdk(body) {
   await import(`../src/sdk.js?boot=${seq}`);
   const fromChrome = (data) => window.dispatchEvent(new window.MessageEvent("message", { data, origin: CHROME_ORIGIN, source: window }));
   const shadow = window.document.querySelector("[data-eh-ui]").shadowRoot;
+  current = { fromChrome };
   return { window, document: window.document, posts, fromChrome, shadow };
 }
 
