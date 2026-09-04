@@ -80,6 +80,21 @@ const ARTIFACT_ORIGIN = `${location.protocol}//${ARTIFACT_HOST}:${location.port}
 const toFrame = (message) =>
   frame.contentWindow && frame.contentWindow.postMessage(message, state.framePolicy?.targetOrigin || ARTIFACT_ORIGIN);
 
+/**
+ * Point the frame at a page without adding a history entry of its own.
+ * Setting `src` records each artifact load in the window's history, so Back
+ * would step through frame loads instead of review pages.
+ */
+function showInFrame(url) {
+  try {
+    if (frame.contentWindow) {
+      frame.contentWindow.location.replace(url);
+      return;
+    }
+  } catch {}
+  frame.src = url;
+}
+
 function artifactUrl(key, bust = false) {
   const query = bust ? `?t=${Date.now()}` : "";
   return `${ARTIFACT_ORIGIN}/artifact/${state.artifactToken}/${key}/index.html${query}`;
@@ -138,7 +153,7 @@ async function loadPage(key, { reload = true } = {}) {
   clearTimeout(retryTimer);
   if (reload) {
     state.reloading = true;
-    frame.src = artifactUrl(key);
+    showInFrame(artifactUrl(key));
   }
   render();
   // Coming back to a dev-server page shows the app's own copy again, without
@@ -1015,7 +1030,7 @@ function connect() {
     // The file on disk changed: queued saves are based on the old version.
     state.baseHash = null;
     clearTimeout(retryTimer);
-    frame.src = artifactUrl(state.key, true);
+    showInFrame(artifactUrl(state.key, true));
     api(pageUrl(state.key, state.sessionId)).then((page) => {
       replacePage(state, page);
       state.save = "idle";
