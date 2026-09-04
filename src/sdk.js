@@ -100,9 +100,25 @@ shadow.innerHTML = `
     .mover:hover { color: #1b1a16; border-color: #c2beb4; }
     .mover:active { cursor: grabbing; }
     .dropline {
-      position: fixed; z-index: 2147483646; height: 0; display: none;
-      border-top: 2px solid #1b1a16; border-radius: 1px; pointer-events: none;
+      position: fixed; z-index: 2147483646; height: 3px; display: none;
+      background: #1f6feb; border-radius: 2px; pointer-events: none;
+      box-shadow: 0 0 0 2px rgba(255,255,255,.9);
     }
+    .dropline::before, .dropline::after {
+      content: ""; position: absolute; top: -3px; width: 9px; height: 9px;
+      border-radius: 50%; background: #1f6feb; box-shadow: 0 0 0 2px rgba(255,255,255,.9);
+    }
+    .dropline::before { left: -4px; }
+    .dropline::after { right: -4px; }
+    .dropTarget { border: 1px dashed #1f6feb; background: rgba(31,111,235,.05); }
+    .dragLabel {
+      position: fixed; z-index: 2147483647; display: none; max-width: 360px; padding: 4px 9px;
+      border-radius: 6px; background: #1b1a16; color: #fbfaf7; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+      font: 11.5px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      box-shadow: 0 4px 14px rgba(27,26,22,.22);
+    }
+    .dragLabel b { color: #9cc2ff; font-weight: 600; }
   </style>
   <div class="box outline" id="outline"></div>
   <div class="box active" id="activeBox"></div>
@@ -117,7 +133,9 @@ shadow.innerHTML = `
     <button class="chip danger" id="linkRemove" title="Remove link" aria-label="Remove link">&#10005;</button>
   </div>
   <div class="mover" id="mover" title="Drag to move this block">&#10303;</div>
+  <div class="box dropTarget" id="dropTarget"></div>
   <div class="dropline" id="dropline"></div>
+  <div class="dragLabel" id="dragLabel"></div>
 `;
 
 const els = {};
@@ -135,6 +153,8 @@ const mountOverlay = () => {
   els.linkRemove = shadow.getElementById("linkRemove");
   els.mover = shadow.getElementById("mover");
   els.dropline = shadow.getElementById("dropline");
+  els.dropTarget = shadow.getElementById("dropTarget");
+  els.dragLabel = shadow.getElementById("dragLabel");
 };
 
 function showMover(el) {
@@ -154,16 +174,35 @@ function showMover(el) {
   els.mover.style.top = `${Math.max(4, r.top + 1)}px`;
 }
 
-function showDropline(drop) {
+/**
+ * Where a dragged block will land: a bold line on the edge it drops against,
+ * a dashed outline on the block that edge belongs to, and a label by the
+ * pointer saying the same in words. Three cues, because a thin line alone
+ * vanishes against borders and bullets.
+ */
+function showDropline(drop, pointer, movingLabel) {
   if (!drop || !drop.ref.isConnected) {
     els.dropline.style.display = "none";
+    els.dropTarget.style.display = "none";
+    els.dragLabel.style.display = "none";
     return;
   }
   const r = drop.ref.getBoundingClientRect();
   els.dropline.style.display = "block";
   els.dropline.style.left = `${r.left}px`;
   els.dropline.style.width = `${r.width}px`;
-  els.dropline.style.top = `${(drop.before ? r.top : r.bottom) - 1}px`;
+  els.dropline.style.top = `${(drop.before ? r.top : r.bottom) - 2}px`;
+  place(els.dropTarget, drop.ref, 3);
+  if (!pointer) return;
+  els.dragLabel.textContent = "";
+  const verb = document.createTextNode(`Move “${clip(movingLabel, 28)}” ${drop.before ? "above" : "below"} `);
+  const target = document.createElement("b");
+  target.textContent = `“${clip(drop.ref.textContent, 32)}”`;
+  els.dragLabel.append(verb, target);
+  els.dragLabel.style.display = "block";
+  const below = pointer.y + 44 < window.innerHeight;
+  els.dragLabel.style.left = `${Math.max(8, Math.min(pointer.x + 14, window.innerWidth - 372))}px`;
+  els.dragLabel.style.top = `${below ? pointer.y + 18 : pointer.y - 34}px`;
 }
 
 function place(box, el, pad = 2) {
@@ -906,7 +945,18 @@ function boot() {
    * Delete and move are the two gestures with no native undo, so the last
    * one is kept restorable: the element itself, detached, plus where it was.
    */
-  let undoable = null; // { kind, el, parent, next, label }
+  /**
+   * Every delete and move stays restorable for the life of the page: the
+   * element itself, detached or relocated, plus where it came from. The
+   * chrome's per-row Undo and ⌘Z both come here.
+   */
+  const undoStack = []; // [{ kind, el, parent, next, label, at }]
+  const remember = (entry) => {
+    undoStack.push({ ...entry, at: Date.now() });
+    if (undoStack.length > 50) undoStack.shift();
+  };
+  /** Timestamp of the last keystroke, so ⌘Z after typing stays the browser's own undo. */
+  let lastInputAt = 0;
 
   els.chipDelete.addEventListener("click", (event) => {
     event.preventDefault();
@@ -916,7 +966,7 @@ function boot() {
     const target = targetFor(hoverTarget);
     const label = target ? target.label : "Element";
     const before = hoverTarget.textContent;
-    undoable = { kind: "deleted", el: hoverTarget, parent: hoverTarget.parentNode, next: hoverTarget.nextSibling, label };
+    remember({ kind: "deleted", el: hoverTarget, parent: hoverTarget.parentNode, prev: hoverTarget.previousSibling, next: hoverTarget.nextSibling, label });
     hoverTarget.remove();
     hoverTarget = null;
     place(els.outline, null);
@@ -927,16 +977,31 @@ function boot() {
   });
 
   const restoreBlock = (label, kind) => {
-    const undo = undoable;
-    undoable = null;
-    if (!undo || undo.label !== label || undo.kind !== kind) return;
-    if (!undo.parent || !undo.parent.isConnected) return;
+    let index = -1;
+    for (let i = undoStack.length - 1; i >= 0; i -= 1) {
+      if (undoStack[i].label === label && undoStack[i].kind === kind) {
+        index = i;
+        break;
+      }
+    }
+    const undo = index === -1 ? null : undoStack[index];
+    if (!undo || !undo.parent || !undo.parent.isConnected) {
+      // Nothing to put back: the page reloaded since, or the spot is gone.
+      post("eh:undoFailed", { label, kind });
+      return false;
+    }
+    undoStack.splice(index, 1);
+    // Either neighbor may have been deleted or moved since; use whichever is
+    // still in place, and only fall back to the end when both are gone.
     const next = undo.next && undo.next.parentNode === undo.parent ? undo.next : null;
-    undo.parent.insertBefore(undo.el, next);
+    const prev = undo.prev && undo.prev.parentNode === undo.parent ? undo.prev : null;
+    undo.parent.insertBefore(undo.el, next || (prev ? prev.nextSibling : null));
     undo.el.style.opacity = "";
-    // The chrome drops the row; the block is back to its captured original,
-    // so there is nothing new to report — only the file to write again.
+    // The chrome drops the row on eh:undone; the block is back to its captured
+    // original, so there is nothing new to report — only the file to write again.
     flushSave();
+    post("eh:undone", { label, kind });
+    return true;
   };
 
   // beforeinput still sees the untouched wording, so capture it once per block.
@@ -1221,6 +1286,18 @@ function boot() {
       const sel = document.getSelection();
       const anchor = sel ? sel.anchorNode : null;
 
+      // ⌘Z right after a block delete or move undoes that, not the last
+      // keystroke — unless typing came after it, which stays the browser's undo.
+      if (meta && !event.shiftKey && !event.altKey && (event.key === "z" || event.key === "Z")) {
+        const last = undoStack[undoStack.length - 1];
+        if (last && last.at > lastInputAt) {
+          event.preventDefault();
+          event.stopPropagation();
+          restoreBlock(last.label, last.kind);
+        }
+        return;
+      }
+
       // ⌘K links the selection, like Docs, Word, and Notion.
       if (meta && !event.shiftKey && !event.altKey && (event.key === "k" || event.key === "K")) {
         if (openLinkbox()) {
@@ -1415,11 +1492,16 @@ function boot() {
     event.preventDefault();
     event.stopPropagation();
     const target = targetFor(el);
-    moving = { el, label: target ? target.label : "Block", drop: null };
+    moving = { el, label: target ? target.label : "Block", drop: null, pointer: { x: event.clientX, y: event.clientY } };
     captureOriginal(moving.el);
+    // Dimming the block is our doing, not the page rendering itself: say so
+    // before touching it, or a move as the first action reads as self-render
+    // and switches saves off for the rest of the review.
+    userEdited = true;
     moving.el.style.opacity = "0.4";
     place(els.outline, null);
     showChip(null);
+    requestAnimationFrame(autoScroll);
     try {
       els.mover.setPointerCapture(event.pointerId);
     } catch {
@@ -1427,11 +1509,35 @@ function boot() {
     }
   });
 
+  /**
+   * Near the top or bottom edge the page scrolls on its own, so a block can
+   * travel further than one screen. Runs per frame while the handle is held.
+   */
+  const EDGE = 56;
+  const autoScroll = () => {
+    if (!moving) return;
+    const { x, y } = moving.pointer;
+    let step = 0;
+    if (y < EDGE) step = -Math.ceil((EDGE - y) / 4);
+    else if (y > window.innerHeight - EDGE) step = Math.ceil((y - (window.innerHeight - EDGE)) / 4);
+    if (step) {
+      window.scrollBy(0, step);
+      const next = dropPointFor(x, y);
+      if (next) moving.drop = next;
+      showDropline(moving.drop, moving.pointer, moving.label);
+    }
+    requestAnimationFrame(autoScroll);
+  };
+
   window.addEventListener("pointermove", (event) => {
     if (!moving) return;
     event.preventDefault();
-    moving.drop = dropPointFor(event.clientX, event.clientY);
-    showDropline(moving.drop);
+    moving.pointer = { x: event.clientX, y: event.clientY };
+    // Over a margin or gutter there is no block under the pointer; keep the
+    // last real target rather than blinking the indicator off and on.
+    const next = dropPointFor(event.clientX, event.clientY);
+    if (next) moving.drop = next;
+    showDropline(moving.drop, moving.pointer, moving.label);
   });
 
   window.addEventListener("pointerup", () => {
@@ -1447,7 +1553,7 @@ function boot() {
     const next = drop.before ? drop.ref : drop.ref.nextElementSibling;
     if (next === el || (drop.before ? drop.ref.previousElementSibling : drop.ref) === el) return;
     userEdited = true;
-    undoable = { kind: "moved", el, parent: el.parentNode, next: el.nextSibling, label };
+    remember({ kind: "moved", el, parent: el.parentNode, prev: el.previousSibling, next: el.nextSibling, label });
     drop.ref.parentNode.insertBefore(el, next);
     const prev = el.previousElementSibling;
     const following = el.nextElementSibling;
@@ -1521,6 +1627,7 @@ function boot() {
 
   document.addEventListener("input", (event) => {
     if (isOurs(event.target)) return;
+    lastInputAt = Date.now();
     // A drop fires deleteByDrag/insertFromDrop input events whose selection
     // points anywhere; finalizeImageDrag writes the real rows instead.
     if (dragging) return;

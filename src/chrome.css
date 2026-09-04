@@ -484,3 +484,17 @@ body.collapsed .handle { right: 0; }
 .leftover-actions .btn-ghost { padding: 4px 10px; font-size: 12px; }
 
 .edit-comment { margin-left: 0; }
+
+/* Per-row undo for the two gestures with no native undo. */
+.edit-row .row-undo {
+  flex: none;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--hair);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--mute-2);
+  font-size: 11px;
+  cursor: pointer;
+}
+.edit-row .row-undo:hover { background: var(--soft); color: var(--strong-txt); border-color: var(--strong-border); }
