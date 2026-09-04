@@ -754,6 +754,26 @@ function boot() {
     }, 0);
   });
 
+  // A selection made with the keyboard (Shift+arrows, Shift+Home/End) never
+  // produces a mouseup, so settle it when the key is released instead. The
+  // wait lets a selection being extended settle once, not on every keystroke.
+  let keySelectTimer = null;
+  document.addEventListener(
+    "keyup",
+    (event) => {
+      if (isOurs(event.target) || resizing || moving || linkState) return;
+      const extending = event.shiftKey && /^(Arrow(Left|Right|Up|Down)|Home|End|PageUp|PageDown)$/.test(event.key);
+      const selectAll = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a";
+      if (event.key !== "Shift" && !extending && !selectAll) return;
+      clearTimeout(keySelectTimer);
+      keySelectTimer = setTimeout(() => {
+        if (Date.now() < suppressUntil || composeOpen) return;
+        settleSelection();
+      }, 250);
+    },
+    true
+  );
+
   document.addEventListener(
     "click",
     (event) => {

@@ -97,6 +97,24 @@ test("typing over a selection that spans blocks reports every block it touched",
   ]);
 });
 
+test("a keyboard selection opens the compose card when the key is released", { skip }, async () => {
+  const { window, document, posts } = await bootSdk("<h1>Plan</h1><p>Select these words with the keyboard.</p>");
+  const p = document.querySelector("p");
+  const range = document.createRange();
+  range.setStart(p.firstChild, 7);
+  range.setEnd(p.firstChild, 12);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  p.dispatchEvent(new window.KeyboardEvent("keyup", { key: "ArrowRight", shiftKey: true, bubbles: true }));
+  p.dispatchEvent(new window.KeyboardEvent("keyup", { key: "Shift", bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const compose = posts.filter((m) => m.type === "eh:compose");
+  assert.equal(compose.length, 1, "one card for the settled selection, not one per keystroke");
+  assert.equal(compose[0].kind, "selection");
+  assert.equal(compose[0].quote, "these");
+});
+
 test("labels number siblings by their order at load, so a deletion does not renumber the rest", { skip }, async () => {
   const { document, posts, shadow } = await bootSdk("<h2>Goals</h2><p>One.</p><p>Two.</p><p>Three.</p>");
   const paragraphs = document.querySelectorAll("p");
