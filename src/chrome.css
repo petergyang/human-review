@@ -498,3 +498,8 @@ body.collapsed .handle { right: 0; }
   cursor: pointer;
 }
 .edit-row .row-undo:hover { background: var(--soft); color: var(--strong-txt); border-color: var(--strong-border); }
+
+/* Feedback the agent already has stays listed until it acks, but reads as done. */
+.badge.sent { background: var(--soft); color: var(--green); }
+.edit-row.sent { opacity: .55; }
+.edit-row.sent .pip { background: var(--green); }

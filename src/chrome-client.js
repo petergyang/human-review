@@ -251,7 +251,12 @@ function render() {
     when.textContent = ago(comment.updatedAt || comment.createdAt);
     who.append(sep, when);
 
-    if (comment.updatedAt) {
+    if (comment.sent) {
+      const badge = document.createElement("span");
+      badge.className = "badge sent";
+      badge.textContent = "sent";
+      who.append(badge);
+    } else if (comment.updatedAt) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = "edited";
@@ -326,7 +331,7 @@ function render() {
     const shown = state.editsExpanded ? edits : edits.slice(0, LIMIT);
     for (const edit of shown) {
       const row = document.createElement("div");
-      row.className = `edit-row${edit.kind === "deleted" ? " deleted" : ""}`;
+      row.className = `edit-row${edit.kind === "deleted" ? " deleted" : ""}${edit.sent ? " sent" : ""}`;
       const pip = document.createElement("span");
       pip.className = "pip";
       const label = document.createElement("span");
@@ -334,9 +339,9 @@ function render() {
       label.textContent = edit.label;
       const kind = document.createElement("span");
       kind.className = "kind";
-      kind.textContent = edit.kind;
+      kind.textContent = edit.sent ? `${edit.kind} · sent` : edit.kind;
       row.append(pip, label, kind);
-      if (edit.kind === "deleted" || edit.kind === "moved") {
+      if (!edit.sent && (edit.kind === "deleted" || edit.kind === "moved")) {
         const undo = document.createElement("button");
         undo.type = "button";
         undo.className = "row-undo";
@@ -397,9 +402,11 @@ function render() {
     }
   }
 
-  // --- send
+  // --- send: only what the agent does not have yet counts. Items from a
+  // batch that is delivered or queued stay listed until the ack, marked sent.
   const otherTotal = others.reduce((sum, o) => sum + o.count, 0);
-  const total = comments.length + edits.length + otherTotal;
+  const unsent = page.unsent || { comments: comments.length, edits: edits.length };
+  const total = unsent.comments + unsent.edits + otherTotal;
   // An overall note is sendable on its own — the server already accepts
   // note-only batches; the button must not stay dead while one is typed.
   const hasNote = $("note").value.trim().length > 0;
@@ -409,11 +416,12 @@ function render() {
   const stranded = state.agent === "stranded";
   // While the agent works, anything new can still be sent: it queues behind
   // the batch in flight and ships with the agent's next poll.
-  const busy = stranded || state.sent || (queued && total === 0 && !hasNote);
-  send.disabled = (total === 0 && !hasNote) || busy;
+  const nothingNew = total === 0 && !hasNote;
+  const busy = stranded || state.sent || (queued && nothingNew);
+  send.disabled = nothingNew || busy;
   send.textContent = stranded
     ? "Sent — agent is not listening"
-    : state.sent
+    : state.sent || (nothingNew && (delivered || queued))
       ? queued
         ? "Sent — queued for the agent"
         : delivered
