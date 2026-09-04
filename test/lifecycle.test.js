@@ -411,3 +411,47 @@ test("the artifact route needs the per-run secret, and a localhost app's own req
 });
 
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+test("feedback the agent already has is marked sent and no longer counted, on this page or others", async (t) => {
+  const first = htmlFile("multi-a.html", '<p>Alpha</p><a href="multi-b.html">next</a>');
+  htmlFile("multi-b.html", "<p>Beta</p>");
+  const { port, token, dispose } = await start(0);
+  t.after(() => dispose());
+  const opened = await open(port, token, first);
+  await comment(port, token, opened.key, "Alpha", "First thought");
+  await edit(port, token, opened.key, { label: "p", before: "Alpha", after: "Alpha!" });
+
+  const waiting = poll(port, token, first);
+  await sleep(30);
+  await send(port, token, opened.key, opened.sessionId);
+  await waiting.promise;
+
+  // On the same page: everything is still listed, all of it marked sent.
+  let page = j(await request(port, token, { route: `/api/page/${opened.key}?session=${opened.sessionId}` }));
+  assert.deepEqual(page.comments.map((c) => c.sent), [true]);
+  assert.deepEqual(page.edits.map((e) => e.sent), [true]);
+  assert.deepEqual(page.unsent, { comments: 0, edits: 0 });
+
+  // Navigate to a second page: the first must not show up as sendable.
+  const moved = j(await request(port, token, { method: "POST", route: `/api/session/${opened.sessionId}/navigate`, body: { href: "multi-b.html" } }));
+  const boot = j(await request(port, token, { route: `/api/session/${opened.sessionId}/page` }));
+  assert.equal(boot.key, moved.key);
+  assert.deepEqual(boot.others, [], "the delivered batch's items are not counted as other-page feedback");
+
+  // New feedback after the send is unsent, and counted.
+  await sleep(15);
+  await comment(port, token, opened.key, "Alpha", "Second thought");
+  const again = j(await request(port, token, { route: `/api/session/${opened.sessionId}/page` }));
+  assert.deepEqual(again.others.map((o) => o.count), [1]);
+  page = j(await request(port, token, { route: `/api/page/${opened.key}` }));
+  assert.deepEqual(page.comments.map((c) => c.sent), [true, false]);
+  assert.deepEqual(page.unsent, { comments: 1, edits: 0 });
+
+  // After the ack the delivered items are gone and only the new one remains.
+  const acked = poll(port, token, first, { ack: true });
+  await sleep(50);
+  page = j(await request(port, token, { route: `/api/page/${opened.key}` }));
+  assert.deepEqual(page.comments.map((c) => [c.feedback, c.sent]), [["Second thought", false]]);
+  assert.deepEqual(page.edits, []);
+  acked.req.destroy();
+});

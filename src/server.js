@@ -228,6 +228,27 @@ export function createServer() {
     for (const session of sessionsForEntry(entryKey)) emit(session, "agent", { state });
   }
 
+  /**
+   * What a page's feedback the agent already has, or that is waiting for it:
+   * every comment id and edit timestamp covered by a batch that is sent and
+   * not yet acked. Those items stay on the page until the ack, but they are
+   * not sendable again, and the browser must not count them as if they were.
+   */
+  function coverageFor(key) {
+    const ids = new Set();
+    let sentAt = 0;
+    for (const record of batches.values()) {
+      for (const entry of [...(record.priorCleanup || []), ...record.cleanup]) {
+        if (entry.key !== key) continue;
+        for (const id of entry.ids) ids.add(id);
+        sentAt = Math.max(sentAt, entry.sentAt || 0);
+      }
+    }
+    return { ids, sentAt };
+  }
+
+  const isSentEdit = (edit, coverage) => (edit.updatedAt || edit.at || 0) < coverage.sentAt;
+
   /** Unsent feedback on every page reachable from this entry target. */
   function unsentCounts(entryKey) {
     const keys = new Set([entryKey]);
@@ -240,8 +261,9 @@ export function createServer() {
     for (const k of keys) {
       const page = store.page(k);
       if (!page) continue;
-      comments += page.comments.length;
-      edits += page.edits.length;
+      const coverage = coverageFor(k);
+      comments += page.comments.filter((c) => !coverage.ids.has(c.id)).length;
+      edits += page.edits.filter((e) => !isSentEdit(e, coverage)).length;
     }
     return { comments, edits };
   }
@@ -393,15 +415,23 @@ export function createServer() {
     return out;
   }
 
-  /** Pages with feedback that are not the one on screen. */
+  /** Pages with feedback still to send that are not the one on screen. */
   function otherPages(session) {
-    return collectPages(session)
-      .filter((p) => p.key !== session.activeKey)
-      .map((p) => ({
-        key: p.key,
-        filename: p.kind === "url" ? new URL(p.url).pathname || p.url : path.basename(p.file),
-        count: p.comments.length + p.edits.length,
-      }));
+    const out = [];
+    for (const key of session.visited) {
+      if (key === session.activeKey) continue;
+      const page = store.page(key);
+      if (!page) continue;
+      const coverage = coverageFor(key);
+      const count = page.comments.filter((c) => !coverage.ids.has(c.id)).length + page.edits.filter((e) => !isSentEdit(e, coverage)).length;
+      if (!count) continue;
+      out.push({
+        key,
+        filename: page.kind === "url" ? new URL(page.url).pathname || page.url : path.basename(page.file),
+        count,
+      });
+    }
+    return out;
   }
 
   function sendBatch(sessionId, note) {
@@ -637,6 +667,7 @@ export function createServer() {
     const entry = session ? store.page(session.entryKey) : null;
     const currentTarget = page.kind === "url" ? page.url : page.file;
     const pollTarget = entry ? (entry.kind === "url" ? entry.url : entry.file) : currentTarget;
+    const coverage = coverageFor(key);
     return {
       key: page.key,
       kind: page.kind === "url" ? "url" : "file",
@@ -645,8 +676,12 @@ export function createServer() {
       filename: page.kind === "url" ? new URL(page.url).pathname || page.url : path.basename(page.file),
       markdown: page.kind !== "url" && isMarkdown(page.file),
       feedbackOnly: page.kind === "url",
-      comments: page.comments,
-      edits: page.edits,
+      comments: page.comments.map((c) => ({ ...c, sent: coverage.ids.has(c.id) })),
+      edits: page.edits.map((e) => ({ ...e, sent: isSentEdit(e, coverage) })),
+      unsent: {
+        comments: page.comments.filter((c) => !coverage.ids.has(c.id)).length,
+        edits: page.edits.filter((e) => !isSentEdit(e, coverage)).length,
+      },
       canRevert: page.kind !== "url" && typeof page.pristine === "string" && page.pristine.length > 0,
       pollCommand: `${cliInvocation} poll ${shellQuote(pollTarget)}`,
     };
