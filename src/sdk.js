@@ -1477,13 +1477,28 @@ function boot() {
   // identity (labels, captured originals, comment anchors) survives the move.
   let moving = null; // { el, label, drop: { ref, before } | null } while the handle is held
 
+  /** Within this many pixels of a container's outer edge, the drop targets the container. */
+  const CONTAINER_EDGE = 10;
+
   const dropPointFor = (x, y) => {
     const under = document.elementFromPoint(x, y);
     if (!under || isOurs(under)) return null;
     const block = innermostBlock(under);
     if (!block || block === moving.el || moving.el.contains(block)) return null;
-    const r = block.getBoundingClientRect();
-    return { ref: block, before: y < r.top + r.height / 2 };
+    // Near the top or bottom edge of a card or section, the whole container
+    // is the target, so a block can be dropped past it rather than only
+    // beside one of its children. The outermost qualifying ancestor wins.
+    let chosen = block;
+    let ancestor = block.parentElement;
+    while (ancestor && ancestor !== document.body && !isOurs(ancestor)) {
+      if (ancestor !== moving.el && !moving.el.contains(ancestor) && isBlock(ancestor)) {
+        const box = ancestor.getBoundingClientRect();
+        if (y - box.top <= CONTAINER_EDGE || box.bottom - y <= CONTAINER_EDGE) chosen = ancestor;
+      }
+      ancestor = ancestor.parentElement;
+    }
+    const r = chosen.getBoundingClientRect();
+    return { ref: chosen, before: y < r.top + r.height / 2 };
   };
 
   els.mover.addEventListener("pointerdown", (event) => {

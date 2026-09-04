@@ -34,7 +34,25 @@ const STYLE = `
   th { background: #f7f5f0; }
   img { max-width: 100%; height: auto; }
   hr { border: none; border-top: 1px solid #eceae3; margin: 2.2em 0; }
+  .diagram { margin: 1em 0; }
+  .diagram pre.mermaid { background: none; padding: 0; text-align: center; }
+  .diagram pre.mermaid svg { max-width: 100%; height: auto; }
 `;
+
+/**
+ * Mermaid renders in the browser from a pinned CDN build, loaded only when a
+ * page has a diagram. It is not bundled: the library and its dependencies
+ * are 80 MB installed, which every `npx` user would pay for on first run.
+ * Offline, or if the load fails, the fence stays a readable code block.
+ */
+export const MERMAID_VERSION = "11.17.2";
+const MERMAID_SRC = `https://cdn.jsdelivr.net/npm/mermaid@${MERMAID_VERSION}/dist/mermaid.esm.min.mjs`;
+const MERMAID_LOADER = `<script type="module" data-eh-diagram>
+import(${JSON.stringify(MERMAID_SRC)}).then(({ default: mermaid }) => {
+  mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+  return mermaid.run({ nodes: document.querySelectorAll("pre.mermaid") });
+}).catch(() => {});
+</script>`;
 
 const escapeHtml = (value) =>
   String(value)
@@ -68,10 +86,17 @@ INERT_RENDERER.image = function (token) {
   if (!href) return escapeHtml(token.text || "");
   return Renderer.prototype.image.call(this, { ...token, href });
 };
+// A ```mermaid fence becomes a diagram. The source stays in the element as
+// text, which is what Mermaid reads and what the review falls back to.
+INERT_RENDERER.code = function (token) {
+  if (String(token.lang || "").trim().toLowerCase() !== "mermaid") return Renderer.prototype.code.call(this, token);
+  return `<div class="diagram" data-block="Diagram"><pre class="mermaid">${escapeHtml(token.text)}</pre></div>\n`;
+};
 
 /** Render a Markdown file into a standalone review page. */
 export function renderMarkdownPage(mdText, file) {
   const body = marked.parse(mdText, { gfm: true, async: false, renderer: INERT_RENDERER });
+  const loader = body.includes('<pre class="mermaid">') ? MERMAID_LOADER : "";
   const title = path.basename(file);
   return `<!DOCTYPE html>
 <html lang="en">
@@ -81,7 +106,7 @@ export function renderMarkdownPage(mdText, file) {
 <title>${title.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</title>
 <style>${STYLE}</style>
 </head>
-<body><main>${body}</main></body>
+<body><main>${body}</main>${loader}</body>
 </html>
 `;
 }

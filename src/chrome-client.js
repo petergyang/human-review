@@ -80,6 +80,21 @@ const ARTIFACT_ORIGIN = `${location.protocol}//${ARTIFACT_HOST}:${location.port}
 const toFrame = (message) =>
   frame.contentWindow && frame.contentWindow.postMessage(message, state.framePolicy?.targetOrigin || ARTIFACT_ORIGIN);
 
+/**
+ * Point the frame at a page without adding a history entry of its own.
+ * Setting `src` records each artifact load in the window's history, so Back
+ * would step through frame loads instead of review pages.
+ */
+function showInFrame(url) {
+  try {
+    if (frame.contentWindow) {
+      frame.contentWindow.location.replace(url);
+      return;
+    }
+  } catch {}
+  frame.src = url;
+}
+
 function artifactUrl(key, bust = false) {
   const query = bust ? `?t=${Date.now()}` : "";
   return `${ARTIFACT_ORIGIN}/artifact/${state.artifactToken}/${key}/index.html${query}`;
@@ -97,7 +112,7 @@ async function rebootstrap() {
     const fresh = await api("/api/session", { method: "POST", body: JSON.stringify({ target }) });
     state.sessionId = fresh.sessionId;
     state.artifactToken = fresh.artifactToken || state.artifactToken;
-    history.replaceState(null, "", fresh.path);
+    history.replaceState({ key: state.key }, "", `${fresh.path}?key=${encodeURIComponent(state.key)}`);
     return true;
   } catch {
     return false;
@@ -138,7 +153,7 @@ async function loadPage(key, { reload = true } = {}) {
   clearTimeout(retryTimer);
   if (reload) {
     state.reloading = true;
-    frame.src = artifactUrl(key);
+    showInFrame(artifactUrl(key));
   }
   render();
   // Coming back to a dev-server page shows the app's own copy again, without
@@ -148,6 +163,33 @@ async function loadPage(key, { reload = true } = {}) {
     toast(`This page renders from your dev server — ${edits} ${edits === 1 ? "edit is" : "edits are"} queued for the agent`);
   }
 }
+
+// ------------------------------------------------------------------ history
+
+/**
+ * Each page shown in this window is a history entry, so Back returns to the
+ * previous page of the review instead of leaving it. The server's idea of
+ * the active page follows along, so a reload lands on the same page.
+ */
+function pushHistory(key) {
+  try {
+    history.pushState({ key }, "", `/s/${state.sessionId}?key=${encodeURIComponent(key)}`);
+  } catch {}
+}
+
+window.addEventListener("popstate", async (event) => {
+  const key = event.state && event.state.key;
+  if (!key || key === state.key || document.querySelector(".ended")) return;
+  await flushFrame();
+  try {
+    await api(`/api/session/${state.sessionId}/goto`, { method: "POST", body: JSON.stringify({ key }) });
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+  state.scroll = { x: 0, y: 0 };
+  await loadPage(key);
+});
 
 // -------------------------------------------------------------------- clock
 
@@ -348,6 +390,7 @@ function render() {
           body: JSON.stringify({ key: other.key }),
         });
         state.scroll = { x: 0, y: 0 };
+        pushHistory(other.key);
         await loadPage(other.key);
       });
       list.append(row);
@@ -763,6 +806,7 @@ window.addEventListener("message", async (event) => {
           body: JSON.stringify({ href: msg.href }),
         });
         state.scroll = { x: 0, y: 0 };
+        pushHistory(result.key);
         await loadPage(result.key);
       } catch (err) {
         toast(err.message);
@@ -986,7 +1030,7 @@ function connect() {
     // The file on disk changed: queued saves are based on the old version.
     state.baseHash = null;
     clearTimeout(retryTimer);
-    frame.src = artifactUrl(state.key, true);
+    showInFrame(artifactUrl(state.key, true));
     api(pageUrl(state.key, state.sessionId)).then((page) => {
       replacePage(state, page);
       state.save = "idle";
@@ -1037,6 +1081,9 @@ function connect() {
   state.artifactToken = bootstrap.artifactToken || "";
   const leftover = bootstrap.leftover || { comments: 0, edits: 0 };
   state.leftover = leftover.comments + leftover.edits ? leftover : null;
+  try {
+    history.replaceState({ key: bootstrap.key }, "", `/s/${state.sessionId}?key=${encodeURIComponent(bootstrap.key)}`);
+  } catch {}
   await loadPage(bootstrap.key);
   connect();
 })();
