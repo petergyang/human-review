@@ -97,7 +97,7 @@ async function rebootstrap() {
     const fresh = await api("/api/session", { method: "POST", body: JSON.stringify({ target }) });
     state.sessionId = fresh.sessionId;
     state.artifactToken = fresh.artifactToken || state.artifactToken;
-    history.replaceState(null, "", fresh.path);
+    history.replaceState({ key: state.key }, "", `${fresh.path}?key=${encodeURIComponent(state.key)}`);
     return true;
   } catch {
     return false;
@@ -148,6 +148,33 @@ async function loadPage(key, { reload = true } = {}) {
     toast(`This page renders from your dev server — ${edits} ${edits === 1 ? "edit is" : "edits are"} queued for the agent`);
   }
 }
+
+// ------------------------------------------------------------------ history
+
+/**
+ * Each page shown in this window is a history entry, so Back returns to the
+ * previous page of the review instead of leaving it. The server's idea of
+ * the active page follows along, so a reload lands on the same page.
+ */
+function pushHistory(key) {
+  try {
+    history.pushState({ key }, "", `/s/${state.sessionId}?key=${encodeURIComponent(key)}`);
+  } catch {}
+}
+
+window.addEventListener("popstate", async (event) => {
+  const key = event.state && event.state.key;
+  if (!key || key === state.key || document.querySelector(".ended")) return;
+  await flushFrame();
+  try {
+    await api(`/api/session/${state.sessionId}/goto`, { method: "POST", body: JSON.stringify({ key }) });
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+  state.scroll = { x: 0, y: 0 };
+  await loadPage(key);
+});
 
 // -------------------------------------------------------------------- clock
 
@@ -348,6 +375,7 @@ function render() {
           body: JSON.stringify({ key: other.key }),
         });
         state.scroll = { x: 0, y: 0 };
+        pushHistory(other.key);
         await loadPage(other.key);
       });
       list.append(row);
@@ -763,6 +791,7 @@ window.addEventListener("message", async (event) => {
           body: JSON.stringify({ href: msg.href }),
         });
         state.scroll = { x: 0, y: 0 };
+        pushHistory(result.key);
         await loadPage(result.key);
       } catch (err) {
         toast(err.message);
@@ -1037,6 +1066,9 @@ function connect() {
   state.artifactToken = bootstrap.artifactToken || "";
   const leftover = bootstrap.leftover || { comments: 0, edits: 0 };
   state.leftover = leftover.comments + leftover.edits ? leftover : null;
+  try {
+    history.replaceState({ key: bootstrap.key }, "", `/s/${state.sessionId}?key=${encodeURIComponent(bootstrap.key)}`);
+  } catch {}
   await loadPage(bootstrap.key);
   connect();
 })();

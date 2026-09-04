@@ -157,3 +157,20 @@ test("a markdown review is rendered, flagged, and never writable", async (t) => 
 });
 
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+test("a mermaid fence renders as a diagram with a lazy loader; other fences stay code", () => {
+  const withDiagram = renderMarkdownPage("# Flow\n\n```mermaid\ngraph TD; A-->B;\n```\n\n```js\nconst x = 1;\n```\n", "/x/flow.md");
+  assert.match(withDiagram, /<div class="diagram" data-block="Diagram"><pre class="mermaid">graph TD; A--&gt;B;<\/pre><\/div>/);
+  assert.match(withDiagram, /<pre><code class="language-js">const x = 1;/);
+  assert.match(withDiagram, /<script type="module" data-eh-diagram>/);
+  assert.match(withDiagram, /cdn\.jsdelivr\.net\/npm\/mermaid@11\.17\.2\/dist\/mermaid\.esm\.min\.mjs/);
+  assert.match(withDiagram, /securityLevel: "strict"/);
+
+  const plain = renderMarkdownPage("# Notes\n\n```js\nconst x = 1;\n```\n", "/x/notes.md");
+  assert.doesNotMatch(plain, /data-eh-diagram/, "no loader when there is nothing to render");
+
+  // Diagram source is text, never markup: a hostile fence cannot inject.
+  const hostile = renderMarkdownPage("```mermaid\n<script>alert(1)</script>\n```\n", "/x/h.md");
+  assert.doesNotMatch(hostile, /<script>alert/);
+  assert.match(hostile, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+});
