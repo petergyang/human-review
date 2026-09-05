@@ -298,3 +298,73 @@ test("a pasted image lands at the caret once the chrome confirms where it was sa
   assert.equal(row.before, "Before the image.");
   assert.match(row.after_html, /<img src="assets\/design-paste-1\.png"/);
 });
+
+// --------------------------------------------------- container title labels
+
+/** The label the SDK gives one element, read off the row a delete reports. */
+async function labelFor(body, selector) {
+  const { window, document, posts, shadow } = await bootSdk(body);
+  const el = document.querySelector(selector);
+  el.dispatchEvent(new window.MouseEvent("mouseover", { bubbles: true }));
+  shadow.getElementById("chipDelete").click();
+  const [row] = rows(posts);
+  return row ? row.label : null;
+}
+
+const SECTIONS = `
+  <section id="a"><header><h2>First section</h2></header><p>Body A.</p></section>
+  <section id="b"><header><h2>Second section</h2></header><p>Body B.</p></section>
+`;
+
+test("a header is named by the heading it holds, not the previous section's", { skip }, async () => {
+  assert.equal(await labelFor(SECTIONS, "#b > header"), "Second section · header");
+});
+
+test("a section is named by its own heading, through the header that wraps it", { skip }, async () => {
+  // Two <section> siblings, so the existing ordinal names which one this is.
+  assert.equal(await labelFor(SECTIONS, "#b"), "Second section · section 2");
+});
+
+test("a heading keeps exactly the label it has today", { skip }, async () => {
+  assert.equal(await labelFor(SECTIONS, "#b h2"), "Second section");
+});
+
+test("a wrapper spanning several sections adopts neither one's heading", { skip }, async () => {
+  const body = `<div id="page">
+    <section><h2>Accounts</h2><p>A.</p></section>
+    <section><h2>Billing</h2><p>B.</p></section>
+  </div>`;
+  const label = await labelFor(body, "#page");
+  assert.notEqual(label, "Accounts · div", "the first child section does not title the wrapper");
+  assert.notEqual(label, "Billing · div");
+});
+
+test("an outer article does not take the heading of an article nested in it", { skip }, async () => {
+  const body = `<article id="outer">
+    <p>Outer introduction.</p>
+    <article><h2>Inner article</h2><p>Inner.</p></article>
+  </article>`;
+  assert.notEqual(await labelFor(body, "#outer"), "Inner article · article");
+});
+
+test("an aside before the real header does not title the section", { skip }, async () => {
+  const body = `<section id="s">
+    <aside><h3>Related links</h3></aside>
+    <header><h2>Billing</h2></header>
+    <p>Body.</p>
+  </section>`;
+  assert.equal(await labelFor(body, "#s"), "Billing · section");
+});
+
+test("a nav heading does not outrank the site title beside it", { skip }, async () => {
+  const body = `<header id="site"><nav><h2>Menu</h2></nav><h1>Acme</h1></header>`;
+  assert.equal(await labelFor(body, "#site"), "Acme · header");
+});
+
+test("a blank heading does not send the label back to the previous section", { skip }, async () => {
+  const body = `
+    <section id="a"><h2>First section</h2><p>Body A.</p></section>
+    <section id="b"><h2>   </h2><p>Actual body text.</p></section>
+  `;
+  assert.notEqual(await labelFor(body, "#b"), "First section · section");
+});

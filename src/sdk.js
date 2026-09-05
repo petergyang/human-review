@@ -372,6 +372,33 @@ function cssPath(el) {
   return ["body", ...parts].join(" > ");
 }
 
+/** Blocks that carry their title somewhere inside them, not necessarily at the top. */
+const TITLED = /^(header|section|article|aside|nav|main)$/i;
+/** Sectioning roots own their own headings, so the walk must not cross into one. */
+const OWN_STOP = /^(section|article|aside|nav|main|figure)$/i;
+const isHeading = (el) => /^h[1-6]$/i.test(el.tagName);
+
+/**
+ * The heading element a block holds as its own title, or null when it holds
+ * none. An element, not a string: a present-but-blank title has to stay
+ * distinguishable from no title, or the caller falls back and mislabels the block.
+ */
+function ownHeadingEl(el) {
+  if (!el || el.nodeType !== 1) return null;
+  // A list, a table, a plain wrapper: a heading buried in its content belongs to
+  // that content, so only a direct child can be the block's own title.
+  if (!TITLED.test(el.tagName)) return [...el.children].find(isHeading) || null;
+  const queue = [...el.children];
+  while (queue.length) {
+    const node = queue.shift();
+    if (isHeading(node)) return node;
+    // A heading inside a nested sectioning root titles that root, not this block.
+    if (OWN_STOP.test(node.tagName)) continue;
+    queue.unshift(...node.children);
+  }
+  return null;
+}
+
 /** The heading a block sits under, used to name edits in arbitrary HTML. */
 function precedingHeading(el) {
   let node = el;
@@ -434,8 +461,14 @@ function targetFor(node) {
   }
 
   if (!pinnedLabels.has(block)) {
-    // A heading names itself; the heading before it would mislabel the edit.
-    const heading = /^h[1-6]$/i.test(block.tagName) ? "" : precedingHeading(block);
+    // A heading names itself; the heading before it would mislabel the edit. A
+    // container is named by the heading it holds, which the preceding-heading
+    // walk skips over, because that walk only ever looks at earlier siblings.
+    let heading = "";
+    if (!/^h[1-6]$/i.test(block.tagName)) {
+      const own = ownHeadingEl(block);
+      heading = own ? own.textContent.trim() : precedingHeading(block);
+    }
     const tag = block.tagName.toLowerCase();
     // Siblings of the same tag would otherwise share a label and collapse into
     // one edit row, so number them — by their order at load, not right now.
