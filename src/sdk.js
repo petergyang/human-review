@@ -6,7 +6,7 @@
  * talks to the server — everything crosses to the chrome page by postMessage.
  */
 import { buildContext, findQuote } from "./anchor-text.js";
-import { hashClickAction, navigationHref } from "./click-target.js";
+import { hashClickAction, inPageControl, navigationHref } from "./click-target.js";
 import { linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
 import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 
@@ -846,8 +846,10 @@ function boot() {
       }
 
       // Plain clicks belong to editing: never navigate, never fire artifact JS.
-      // A <summary> keeps its native toggle: collapsed content must stay reachable.
-      if (href || (event.target.closest && event.target.closest("button, [role='button']"))) {
+      // A <summary>, tab, or other in-page toggle keeps working: collapsed
+      // content must stay reachable, and its text stays editable either way.
+      const button = event.target.closest && event.target.closest("button, [role='button']");
+      if (href || (button && !inPageControl(event.target))) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -876,7 +878,7 @@ function boot() {
       showMover(hoverMove);
     }
     showGrip(hoverMedia);
-    const interactive = event.target.closest && event.target.closest("a[href], [data-href], button, [role='button']");
+    const interactive = event.target.closest && event.target.closest("a[href], [data-href], button, [role='button']") && (navigationHref(event.target) || !inPageControl(event.target));
     const draggable = hoverMedia && hoverMedia.tagName === "IMG";
     showHint(interactive ? "⌘-click to open" : draggable ? "Drag to move" : "", event.clientX, event.clientY);
   });

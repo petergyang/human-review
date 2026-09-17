@@ -268,6 +268,31 @@ test("⌘K on an existing link retargets it, and Remove unwraps it, each as one 
   assert.equal(removed.after_html, "<p>Read the spec first.</p>");
 });
 
+test("a plain click reaches tabs and toggles, but not bare buttons or links", { skip }, async () => {
+  const { window, document } = await bootSdk(
+    `<button type="button" id="tab" aria-expanded="false"><span>Find work to automate</span></button>
+     <div role="tab" id="roletab">Advisor</div>
+     <button type="button" id="bare">Delete item</button>
+     <a href="/next"><button type="button" id="linked" aria-expanded="false">Next page</button></a>`
+  );
+  const reached = new Set();
+  for (const id of ["tab", "roletab", "bare", "linked"]) document.getElementById(id).addEventListener("click", () => reached.add(id));
+  const click = (el, init = {}) => {
+    const event = new window.MouseEvent("click", { bubbles: true, cancelable: true, ...init });
+    el.dispatchEvent(event);
+    return event;
+  };
+
+  assert.equal(click(document.querySelector("#tab span")).defaultPrevented, false, "clicking the tab's title switches the tab");
+  click(document.getElementById("roletab"));
+  assert.equal(click(document.getElementById("bare")).defaultPrevented, true);
+  assert.equal(click(document.getElementById("linked")).defaultPrevented, true, "a toggle inside a link still never navigates");
+  assert.deepEqual([...reached].sort(), ["roletab", "tab"]);
+
+  click(document.getElementById("bare"), { metaKey: true });
+  assert.ok(reached.has("bare"), "⌘-click still runs a bare button");
+});
+
 test("a pasted image lands at the caret once the chrome confirms where it was saved", { skip }, async () => {
   const { window, document, posts, fromChrome } = await bootSdk("<h2>Design</h2><p>Before the image.</p>");
   const p = document.querySelector("p");
