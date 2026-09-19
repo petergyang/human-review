@@ -125,8 +125,10 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   or their fix disappears on the next build.
 - **`edits_saved: true` means those edits are already in the file on disk.**
   Plain HTML files autosave as the user types, so your copy of the file is
-  stale. Re-read the file before touching it and make targeted changes only;
-  never regenerate it from what you wrote earlier, or their work disappears.
+  stale. Those rows need no action — do not re-apply them. Re-read the file
+  before touching it, work on the comments, and leave every edited block
+  exactly as it is on disk; never regenerate the file from what you wrote
+  earlier, or their work disappears.
   `edits_saved: false` (Markdown, localhost pages, self-rendering HTML) means the
   edits exist only in this batch — apply them to the source yourself.
 - An edit with `kind: "deleted"` means the user removed that whole block:
