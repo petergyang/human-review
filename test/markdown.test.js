@@ -10,7 +10,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "human-review-markdown-"));
 process.env.HUMAN_REVIEW_STATE_DIR = path.join(tmp, "state");
 
 const { start } = await import("../src/server.js");
-const { isMarkdown, renderMarkdownPage } = await import("../src/markdown.js");
+const { isMarkdown, renderMarkdownPage, detectDirection } = await import("../src/markdown.js");
 
 function request(port, token, { method = "GET", route = "/", body = null } = {}) {
   return new Promise((resolve, reject) => {
@@ -173,4 +173,51 @@ test("a mermaid fence renders as a diagram with a lazy loader; other fences stay
   const hostile = renderMarkdownPage("```mermaid\n<script>alert(1)</script>\n```\n", "/x/h.md");
   assert.doesNotMatch(hostile, /<script>alert/);
   assert.match(hostile, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+});
+
+test("right-to-left prose renders mirrored, and left-to-right prose is untouched", () => {
+  const arabic = renderMarkdownPage("# عنوان\n\nنص عربي كامل في هذا المستند.\n", "/x/ar.md");
+  assert.match(arabic, /<html lang="ar" dir="rtl">/);
+  assert.match(arabic, /unicode-bidi: plaintext/, "blocks resolve their own direction");
+  assert.match(arabic, /border-inline-start: 3px solid/, "the quote bar follows the text edge");
+
+  // Code is not prose: it stays left-to-right inside a mirrored page.
+  assert.match(arabic, /code, pre, pre code \{\s*direction: ltr/);
+
+  const hebrew = renderMarkdownPage("# כותרת\n\nטקסט בעברית בלבד כאן.\n", "/x/he.md");
+  assert.match(hebrew, /<html lang="he" dir="rtl">/);
+
+  const english = renderMarkdownPage("# Title\n\nOrdinary English prose.\n", "/x/en.md");
+  assert.match(english, /<html lang="en" dir="ltr">/);
+  assert.doesNotMatch(english, /unicode-bidi: plaintext/, "no RTL rules on an LTR page");
+});
+
+test("code samples do not outvote the sentences around them", () => {
+  const md = "# عنوان قصير\n\nجملة عربية واحدة.\n\n```js\nconst aVeryLongIdentifier = buildSomethingComplicated(withAnotherArgument);\n```\n";
+  assert.equal(detectDirection(md).dir, "rtl");
+  assert.equal(detectDirection("# Title\n\nEnglish, with كلمة واحدة only.\n").dir, "ltr");
+  assert.equal(detectDirection("").dir, "ltr");
+});
+
+test("a reviewer's own RTL font is honoured, and a hostile one is refused", () => {
+  const env = { ...process.env };
+  try {
+    process.env.HUMAN_REVIEW_RTL_FONT = '"Baloo Bhaijaan 2"';
+    process.env.HUMAN_REVIEW_RTL_FONT_URL =
+      "https://fonts.googleapis.com/css2?family=Baloo+Bhaijaan+2:wght@400..800&display=swap";
+    const page = renderMarkdownPage("نص عربي هنا.", "/x/a.md");
+    assert.match(page, /font-family: "Baloo Bhaijaan 2",/);
+    assert.match(page, /<link rel="stylesheet" href="https:\/\/fonts\.googleapis\.com[^"]*"/);
+    assert.match(page, /&amp;display=swap/, "the URL is escaped into the attribute");
+
+    // A family that could close the style element, and a non-https URL, are both dropped.
+    process.env.HUMAN_REVIEW_RTL_FONT = "x;}</style><script>alert(1)</script>";
+    process.env.HUMAN_REVIEW_RTL_FONT_URL = "javascript:alert(1)";
+    const hostile = renderMarkdownPage("نص عربي هنا.", "/x/b.md");
+    assert.doesNotMatch(hostile, /<script>alert/);
+    assert.doesNotMatch(hostile, /<link/);
+    assert.match(hostile, /font-family: "SF Arabic"/, "falls back to the default stack");
+  } finally {
+    process.env = env;
+  }
 });
