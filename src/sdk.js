@@ -372,16 +372,32 @@ function cssPath(el) {
   return ["body", ...parts].join(" > ");
 }
 
+/**
+ * A heading's own words. Many sites append a permalink ("#", "¶", "§", an
+ * icon) to each heading; it is not part of the name, and left in it turns
+ * "Tiers" into "Tiers#" in every label under that heading.
+ */
+const isPermalink = (a) => !/[\p{L}\p{N}]/u.test(a.textContent);
+function headingText(h) {
+  const links = [...h.querySelectorAll('a[href^="#"]')].filter(isPermalink);
+  if (!links.length) return h.textContent.trim();
+  const clone = h.cloneNode(true);
+  clone.querySelectorAll('a[href^="#"]').forEach((a) => {
+    if (isPermalink(a)) a.remove();
+  });
+  return clone.textContent.trim();
+}
+
 /** The heading a block sits under, used to name edits in arbitrary HTML. */
 function precedingHeading(el) {
   let node = el;
   while (node && node !== document.body) {
     let sib = node.previousElementSibling;
     while (sib) {
-      if (/^h[1-6]$/i.test(sib.tagName) && sib.textContent.trim()) return sib.textContent.trim();
+      if (/^h[1-6]$/i.test(sib.tagName) && headingText(sib)) return headingText(sib);
       const nested = sib.querySelectorAll ? sib.querySelectorAll("h1,h2,h3,h4,h5,h6") : [];
       for (let i = nested.length - 1; i >= 0; i -= 1) {
-        if (nested[i].textContent.trim()) return nested[i].textContent.trim();
+        if (headingText(nested[i])) return headingText(nested[i]);
       }
       sib = sib.previousElementSibling;
     }
@@ -404,19 +420,64 @@ const clip = (text, limit = 40) => {
 const pinnedLabels = new WeakMap();
 
 /**
- * Sibling order as the page loaded. Ordinals in labels ("p 3") come from
- * here, so deleting a paragraph does not renumber the ones after it and hand
- * two different blocks the same label within one review.
+ * Each element's section as the page loaded: the heading before it, and its
+ * place among the section's elements of the same tag. Ordinals in labels
+ * ("p 3") come from here, so deleting a paragraph does not renumber the ones
+ * after it. Counting within the section, not among siblings, matters too:
+ * three cards that each hold one <p> are three different blocks, and naming
+ * them all "Section · p" merges their edits into one row. Headings are read
+ * at load as well, so deleting a heading does not move the blocks under it
+ * into the section above.
  */
-const bootChildren = new WeakMap();
+const bootSection = new WeakMap(); // element -> { heading, ordinal, count }
 function snapshotOrder() {
-  for (const el of [document.body, ...document.body.querySelectorAll("*")]) {
-    if (el.children.length > 1 && !isOurs(el)) bootChildren.set(el, [...el.children]);
+  let heading = "";
+  const counts = new Map();
+  const seen = [];
+  for (const el of document.body.querySelectorAll("*")) {
+    if (isOurs(el)) continue;
+    const key = `${heading}\u0000${el.tagName}`;
+    const ordinal = (counts.get(key) || 0) + 1;
+    counts.set(key, ordinal);
+    seen.push([el, heading, key, ordinal]);
+    if (/^h[1-6]$/i.test(el.tagName) && headingText(el)) heading = headingText(el);
   }
+  for (const [el, h, key, ordinal] of seen) bootSection.set(el, { heading: h, ordinal, count: counts.get(key) });
+}
+
+/**
+ * Labels are the only identity an edit row has: the server merges rows that
+ * share one. So no two blocks may ever hold the same label in one review.
+ */
+const labelOwners = new Map(); // label -> block
+/**
+ * Blocks the user created in this review: Enter, paste. They have no
+ * `before`, and deleting one again takes back its rows. Only elements added
+ * while the user was typing count; a page that renders more content after
+ * load has not had it "created" by the reviewer.
+ */
+const createdBlocks = new WeakSet();
+let typing = false;
+function noteAdded(records) {
+  if (!typing) return;
+  for (const record of records) {
+    for (const node of record.addedNodes) {
+      if (node.nodeType !== 1 || isOurs(node)) continue;
+      for (const el of [node, ...node.querySelectorAll("*")]) if (!bootSection.has(el)) createdBlocks.add(el);
+    }
+  }
+}
+const additions = new MutationObserver(noteAdded);
+function claimLabel(block, label) {
+  let unique = label;
+  for (let n = 2; labelOwners.has(unique) && labelOwners.get(unique) !== block; n += 1) unique = `${label} (${n})`;
+  labelOwners.set(unique, block);
+  pinnedLabels.set(block, unique);
+  return unique;
 }
 
 /** The block a hover/edit belongs to, plus a human label for the edit list. */
-function targetFor(node) {
+function targetFor(node, allowEmpty = false) {
   const el = node && node.nodeType === 1 ? node : node && node.parentElement;
   if (!el || isOurs(el)) return null;
 
@@ -429,23 +490,37 @@ function targetFor(node) {
   let block = el;
   while (block && block !== document.body && !isBlock(block)) block = block.parentElement;
   if (!block || block === document.body || !block.textContent.trim()) {
+    // An edit can leave a block empty (select all, delete): that block is
+    // still the one that changed, and reporting it beats a nameless row.
     if (el !== document.body && MEDIA.test(el.tagName)) block = el;
-    else return null;
+    else if (!allowEmpty || !block || block === document.body) return null;
   }
 
   if (!pinnedLabels.has(block)) {
     // A heading names itself; the heading before it would mislabel the edit.
-    const heading = /^h[1-6]$/i.test(block.tagName) ? "" : precedingHeading(block);
+    const isHeading = /^h[1-6]$/i.test(block.tagName);
     const tag = block.tagName.toLowerCase();
-    // Siblings of the same tag would otherwise share a label and collapse into
-    // one edit row, so number them — by their order at load, not right now.
-    const parent = block.parentElement;
-    const live = parent ? [...parent.children] : [];
-    const booted = parent ? bootChildren.get(parent) : null;
-    const siblings = booted && booted.includes(block) ? booted : live;
-    const twins = siblings.filter((c) => c.tagName === block.tagName);
-    const ordinal = twins.length > 1 ? ` ${twins.indexOf(block) + 1}` : "";
-    pinnedLabels.set(block, heading ? `${clip(heading, 26)} · ${tag}${ordinal}` : clip(block.textContent, 40) || tag);
+    const booted = bootSection.get(block);
+    const ownText = () => clip(isHeading ? headingText(block) : block.textContent, 40) || tag;
+    let label;
+    if (booted) {
+      // Blocks of the same tag in one section are numbered by their order at
+      // load, not right now, so a deletion does not renumber the rest.
+      const ordinal = booted.count > 1 ? ` ${booted.ordinal}` : "";
+      label = !isHeading && booted.heading ? `${clip(booted.heading, 26)} · ${tag}${ordinal}` : ownText();
+    } else if (createdBlocks.has(block)) {
+      // Numbering a block the user just made by where it sits now would hand
+      // it an existing block's label and merge the two rows.
+      const heading = isHeading ? "" : precedingHeading(block);
+      label = heading ? `${clip(heading, 26)} · new ${tag}` : `new ${tag}`;
+    } else {
+      // Rendered by the page after load: number it among its siblings now.
+      const heading = isHeading ? "" : precedingHeading(block);
+      const twins = block.parentElement ? [...block.parentElement.children].filter((c) => c.tagName === block.tagName) : [block];
+      const ordinal = twins.length > 1 ? ` ${twins.indexOf(block) + 1}` : "";
+      label = heading ? `${clip(heading, 26)} · ${tag}${ordinal}` : ownText();
+    }
+    claimLabel(block, label);
   }
   return { el: block, label: pinnedLabels.get(block), authored: false };
 }
@@ -614,8 +689,12 @@ function flushEdits() {
   editQueue.clear();
 }
 
+/** Labels with an "edited" row out, so a deletion knows there is one to take back. */
+const editedLabels = new Set();
+
 function queueEdit(payload) {
   const key = `${payload.label}\u0000${payload.kind}`;
+  if (payload.kind === "edited") editedLabels.add(payload.label);
   const queued = editQueue.get(key);
   if (queued && (queued.staged_assets || payload.staged_assets)) {
     const assets = [...(queued.staged_assets || []), ...(payload.staged_assets || [])];
@@ -776,6 +855,7 @@ function boot() {
   keepBodyEditable(document.body);
   document.body.spellcheck = false;
   snapshotOrder();
+  additions.observe(document.body, { childList: true, subtree: true });
   baseline = serialize();
   bootSnapshot = baseline;
   watchSelfRendering();
@@ -960,6 +1040,31 @@ function boot() {
   /** Timestamp of the last keystroke, so ⌘Z after typing stays the browser's own undo. */
   let lastInputAt = 0;
 
+  /** Take back a block's "edited" row, queued or already sent. */
+  const retireEdited = (label) => {
+    editQueue.delete(`${label}\u0000edited`);
+    if (editedLabels.delete(label)) post("eh:dropEdit", { label, kind: "edited" });
+  };
+
+  /**
+   * One "deleted" row for a block that is gone, describing it as the page
+   * had it: an agent looks for `before` in the source, and a block retyped
+   * and then deleted needs no separate "edited" row.
+   */
+  const reportGone = (el, label) => {
+    retireEdited(label);
+    // A block made in this review and removed again never reached the file.
+    if (createdBlocks.has(el)) return;
+    queueEdit({
+      label,
+      kind: "deleted",
+      before: originalText.has(el) ? originalText.get(el) : el.textContent,
+      after: "",
+      before_html: originalHtml.get(el),
+      after_html: "",
+    });
+  };
+
   els.chipDelete.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -967,13 +1072,13 @@ function boot() {
     userEdited = true;
     const target = targetFor(hoverTarget);
     const label = target ? target.label : "Element";
-    const before = hoverTarget.textContent;
-    remember({ kind: "deleted", el: hoverTarget, parent: hoverTarget.parentNode, prev: hoverTarget.previousSibling, next: hoverTarget.nextSibling, label });
-    hoverTarget.remove();
+    const el = hoverTarget;
+    remember({ kind: "deleted", el, parent: el.parentNode, prev: el.previousSibling, next: el.nextSibling, label });
+    el.remove();
     hoverTarget = null;
     place(els.outline, null);
     showChip(null);
-    queueEdit({ label, kind: "deleted", before, after: "" });
+    reportGone(el, label);
     flushSave();
     post("eh:undoable", { label, kind: "deleted" });
   });
@@ -999,8 +1104,9 @@ function boot() {
     const prev = undo.prev && undo.prev.parentNode === undo.parent ? undo.prev : null;
     undo.parent.insertBefore(undo.el, next || (prev ? prev.nextSibling : null));
     undo.el.style.opacity = "";
-    // The chrome drops the row on eh:undone; the block is back to its captured
-    // original, so there is nothing new to report — only the file to write again.
+    // The chrome drops the row on eh:undone. A block that was retyped or
+    // created before it was deleted gets its "edited" row back.
+    if (kind === "deleted" && (createdBlocks.has(undo.el) || changedSince(undo.el))) emitBlockEdit(undo.el, label);
     flushSave();
     post("eh:undone", { label, kind });
     return true;
@@ -1027,8 +1133,13 @@ function boot() {
     // The input event fired inside execCommand, before this ran, and the
     // fresh element named itself ("li 3", no `before`). Retract that row.
     const stale = pinnedLabels.get(created);
-    if (stale && stale !== source.label) editQueue.delete(`${stale}\u0000edited`);
+    if (stale && stale !== source.label) {
+      editQueue.delete(`${stale}\u0000edited`);
+      if (labelOwners.get(stale) === created) labelOwners.delete(stale);
+    }
     pinnedLabels.set(created, source.label);
+    labelOwners.set(source.label, created);
+    createdBlocks.delete(created);
     if (!originalText.has(created) && originalText.has(source.el)) {
       originalText.set(created, originalText.get(source.el));
       originalHtml.set(created, originalHtml.get(source.el));
@@ -1078,21 +1189,49 @@ function boot() {
     return found;
   };
   let affected = null; // targets of a multi-block selection, until the input event reports them
+  let around = null; // the caret's block and its neighbours, until the input event reports them
+
+  const changedSince = (el) => originalHtml.has(el) && originalHtml.get(el) !== blockHtml(el);
+
+  /** Where a block the user added sits: the start of the blocks either side of it. */
+  const placeOf = (el) => {
+    const side = (step) => {
+      let n = el[step];
+      while (n && isOurs(n)) n = n[step];
+      return n ? clip(n.textContent, 90) : "";
+    };
+    return { added: true, added_after: side("previousElementSibling"), added_before: side("nextElementSibling") };
+  };
+
+  /**
+   * The row for a block that changed. Text alone loses formatting-only edits
+   * (bold, italic, underline change markup, not textContent), so the block's
+   * cleaned HTML travels too. A block the user added has no `before`; it
+   * says where it sits instead.
+   */
+  const rowFor = (el, label, extra = {}) => {
+    const added = createdBlocks.has(el);
+    return {
+      label,
+      kind: "edited",
+      before: added ? undefined : originalText.get(el),
+      after: el.textContent,
+      before_html: added ? undefined : originalHtml.get(el),
+      after_html: blockHtml(el),
+      ...(added ? placeOf(el) : {}),
+      ...extra,
+    };
+  };
 
   /** An edit row for a block changed outside the input-event flow (attribute
    * set, link removal, drag move) — the same shape the input listener emits. */
   const emitBlockEdit = (blockEl, fallbackLabel, extra = {}) => {
-    const connected = blockEl.isConnected;
-    const target = connected ? targetFor(blockEl) : null;
-    queueEdit({
-      label: (target && target.label) || fallbackLabel || "Document body",
-      kind: "edited",
-      before: originalText.get(blockEl),
-      after: connected ? blockEl.textContent : "",
-      before_html: originalHtml.get(blockEl),
-      after_html: connected ? blockHtml(blockEl) : "",
-      ...extra,
-    });
+    if (!blockEl.isConnected) {
+      queueEdit({ label: fallbackLabel || "Document body", kind: "edited", before: originalText.get(blockEl), after: "", before_html: originalHtml.get(blockEl), after_html: "", ...extra });
+      return;
+    }
+    const target = targetFor(blockEl, true);
+    queueEdit(rowFor(blockEl, (target && target.label) || fallbackLabel || "Document body", extra));
   };
 
   let typingUntil = 0;
@@ -1129,13 +1268,30 @@ function boot() {
       suppressActionControlsWhileTyping();
       // From here on, DOM drift is the human typing, not the page rendering.
       userEdited = true;
+      // Blocks added from now until this keystroke's input event are the user's.
+      typing = true;
+      setTimeout(() => {
+        typing = false;
+      }, 0);
       const sel = document.getSelection();
       const range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
       const blocks = range ? blocksInRange(range) : [];
-      const target = blocks[0] || targetFor(event.target);
+      const target = blocks[0] || (range && targetFor(range.startContainer, true)) || targetFor(event.target, true);
       if (target) captureOriginal(target.el);
       for (const block of blocks) captureOriginal(block.el);
       affected = blocks.length > 1 ? blocks : null;
+      // Enter leaves the first half of a block behind, and Backspace or Delete
+      // at a block's edge merges a neighbour into it. The input event only
+      // sees the block the caret lands in, so keep the others it can touch.
+      around = null;
+      if (!affected && target && !target.authored) {
+        const sibling = (n) => {
+          const t = n && !isOurs(n) ? targetFor(n) : null;
+          return t && t.el === n ? t : null;
+        };
+        around = [target, sibling(target.el.previousElementSibling), sibling(target.el.nextElementSibling)].filter(Boolean);
+        for (const t of around) captureOriginal(t.el);
+      }
     },
     true
   );
@@ -1653,31 +1809,41 @@ function boot() {
       clearPending();
       post("eh:dismiss", {});
     }
+    // Blocks this keystroke created (Enter, paste) must be known as the
+    // user's before any of them is named.
+    noteAdded(additions.takeRecords());
     if (affected) {
       // A selection spanning blocks: the first absorbed the rest, and any
       // block that is gone now is a deletion in its own right.
       const blocks = affected;
       affected = null;
+      around = null;
       for (const block of blocks) {
         if (block.el.isConnected) emitBlockEdit(block.el, block.label);
-        else queueEdit({ label: block.label, kind: "deleted", before: originalText.get(block.el), after: "", before_html: originalHtml.get(block.el), after_html: "" });
+        else reportGone(block.el, block.label);
       }
       scheduleSave();
       return;
     }
     const sel = document.getSelection();
     const node = sel && sel.anchorNode ? sel.anchorNode : event.target;
-    const target = targetFor(node);
-    // Text alone loses formatting-only edits (bold, italic, underline change
-    // markup, not textContent), so the block's cleaned HTML travels too.
-    queueEdit({
-      label: target ? target.label : "Document body",
-      kind: "edited",
-      before: target ? originalText.get(target.el) : undefined,
-      after: target ? target.el.textContent : undefined,
-      before_html: target ? originalHtml.get(target.el) : undefined,
-      after_html: target ? blockHtml(target.el) : undefined,
-    });
+    const target = targetFor(node, true);
+    // No block to name (the caret sits on the page itself): a row saying
+    // only "Document body" tells the agent nothing, so there is none. A
+    // block back to exactly how it loaded (Enter above it, an edit typed and
+    // undone) has nothing to report either.
+    if (target) {
+      const unchanged = !createdBlocks.has(target.el) && originalHtml.has(target.el) && !changedSince(target.el);
+      if (unchanged) retireEdited(target.label);
+      else queueEdit(rowFor(target.el, target.label));
+    }
+    const others = around || [];
+    around = null;
+    for (const other of others) {
+      if (target && other.el === target.el) continue;
+      if (!other.el.isConnected) reportGone(other.el, other.label);
+      else if (changedSince(other.el)) emitBlockEdit(other.el, other.label);
+    }
     scheduleSave();
   });
 
