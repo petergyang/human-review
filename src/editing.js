@@ -71,3 +71,18 @@ export function normalizeHref(raw) {
   }
   return candidate;
 }
+
+/**
+ * Chrome types U+00A0 (serialized as &nbsp;) for a space it would otherwise
+ * collapse: at the end of a line, or next to another space. The agent
+ * carries `after` into the source verbatim, so those land as literal
+ * non-breaking spaces nobody asked for. When the block had none before the
+ * edit, every one in the new wording came from typing: make it a space.
+ */
+export function dropTypedNbsp(row) {
+  if (!row || typeof row.after !== "string" || !row.after.includes("\u00a0")) return row;
+  if (typeof row.before === "string" && row.before.includes("\u00a0")) return row;
+  const out = { ...row, after: row.after.replace(/\u00a0/g, " ") };
+  if (typeof row.after_html === "string") out.after_html = row.after_html.replace(/&nbsp;|\u00a0/g, " ");
+  return out;
+}

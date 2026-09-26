@@ -7,7 +7,7 @@
  */
 import { buildContext, findQuote } from "./anchor-text.js";
 import { hashClickAction, inPageControl, navigationHref } from "./click-target.js";
-import { linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
+import { dropTypedNbsp, linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
 import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 
 /**
@@ -610,7 +610,7 @@ let editTimer = null;
 function flushEdits() {
   clearTimeout(editTimer);
   editTimer = null;
-  for (const payload of editQueue.values()) post("eh:edit", payload);
+  for (const payload of editQueue.values()) post("eh:edit", dropTypedNbsp(payload));
   editQueue.clear();
 }
 

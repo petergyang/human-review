@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "../src/editing.js";
+import { dropTypedNbsp, linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "../src/editing.js";
 
 test("list markers typed at the start of a line convert to the right list", () => {
   assert.equal(listCommandFor("-"), "insertUnorderedList");
@@ -72,4 +72,28 @@ test("executable and unknown schemes are rejected outright", () => {
   assert.equal(normalizeHref("data:text/html,<script>x</script>"), "");
   assert.equal(normalizeHref("vbscript:x"), "");
   assert.equal(normalizeHref(""), "");
+});
+
+test("non-breaking spaces the browser typed come back as plain spaces", () => {
+  const row = dropTypedNbsp({
+    label: "p 3",
+    kind: "edited",
+    before: "I rebuilt Encounter, in the browser.",
+    after: "I rebuilt Encounter –\u00a0Paul Woakes\u2019s game –\u00a0in the browser.",
+    after_html: "<p>I rebuilt <i>Encounter –&nbsp;</i>Paul Woakes’s game –&nbsp;in the browser.</p>",
+  });
+  assert.equal(row.after, "I rebuilt Encounter – Paul Woakes\u2019s game – in the browser.");
+  assert.equal(row.after_html, "<p>I rebuilt <i>Encounter – </i>Paul Woakes’s game – in the browser.</p>");
+});
+
+test("a block that already had non-breaking spaces keeps every one", () => {
+  const row = { label: "p", kind: "edited", before: "10\u00a0km away", after: "12\u00a0km away", after_html: "<p>12&nbsp;km away</p>" };
+  assert.equal(dropTypedNbsp(row), row);
+});
+
+test("rows without typed non-breaking spaces pass through untouched", () => {
+  const deleted = { label: "p", kind: "deleted", before: "Gone.", after: "" };
+  assert.equal(dropTypedNbsp(deleted), deleted);
+  const added = { label: "new p", kind: "edited", after: "Typed\u00a0", after_html: "<p>Typed&nbsp;</p>" };
+  assert.deepEqual(dropTypedNbsp(added), { ...added, after: "Typed ", after_html: "<p>Typed </p>" });
 });
