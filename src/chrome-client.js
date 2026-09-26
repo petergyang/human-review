@@ -736,6 +736,9 @@ window.addEventListener("message", async (event) => {
             after_html: msg.after_html,
             moved_after: msg.moved_after,
             moved_before: msg.moved_before,
+            added: msg.added,
+            added_after: msg.added_after,
+            added_before: msg.added_before,
             staged_assets: msg.staged_assets,
           }),
         })).page;
@@ -750,6 +753,9 @@ window.addEventListener("message", async (event) => {
         ms: 8000,
         onAction: () => undoBlock(msg.label, msg.kind),
       });
+      break;
+    case "eh:dropEdit":
+      dropEditRow(String(msg.label || ""), String(msg.kind || ""));
       break;
     case "eh:undone":
       document.querySelectorAll(".toast").forEach((el) => el.remove());

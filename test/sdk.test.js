@@ -323,3 +323,198 @@ test("a pasted image lands at the caret once the chrome confirms where it was sa
   assert.equal(row.before, "Before the image.");
   assert.match(row.after_html, /<img src="assets\/design-paste-1\.png"/);
 });
+
+// ---------------------------------------------------- one block, one row
+
+const caretAt = (window, node, offset) => {
+  const range = window.document.createRange();
+  range.setStart(node, offset);
+  range.collapse(true);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+};
+
+/**
+ * One keystroke the way the browser delivers it: beforeinput with the caret
+ * where it was, the browser's own change to the DOM, input with the caret
+ * where the change left it.
+ */
+function keystroke(window, at, change) {
+  caretAt(window, ...at);
+  window.document.body.dispatchEvent(new window.Event("beforeinput", { bubbles: true }));
+  const caret = change();
+  caretAt(window, ...caret);
+  window.document.body.dispatchEvent(new window.Event("input", { bubbles: true }));
+}
+
+/** Retype a whole block. */
+const typeInto = (window, el, html) =>
+  keystroke(window, [el.firstChild || el, 0], () => {
+    el.innerHTML = html;
+    return [el, el.childNodes.length];
+  });
+
+/** Enter at `offset` in a block's text: the block keeps the first half and a new block after it takes the rest, as Chrome does. */
+const pressEnter = (window, el, offset) =>
+  keystroke(window, [el.firstChild, offset], () => {
+    const rest = el.firstChild.splitText(offset);
+    const added = el.cloneNode(false);
+    added.appendChild(rest);
+    el.after(added);
+    return [added.firstChild, 0];
+  });
+
+const deleteBlock = (window, shadow, el) => {
+  el.dispatchEvent(new window.MouseEvent("mouseover", { bubbles: true }));
+  shadow.getElementById("chipDelete").click();
+};
+
+const fullRows = (posts) => posts.filter((m) => m.type === "eh:edit");
+
+test("blocks that are each alone in their own container still get labels of their own", { skip }, async () => {
+  const { window, document, posts, fromChrome } = await bootSdk(
+    "<h2>Principles</h2><div><div><b>One</b><p>First card.</p></div><div><b>Two</b><p>Second card.</p></div><div><b>Three</b><p>Third card.</p></div></div>"
+  );
+  const cards = document.querySelectorAll("p");
+  typeInto(window, cards[0], "First card, touched.");
+  typeInto(window, cards[2], "Third <i>card</i>.");
+  fromChrome({ type: "eh:flush" });
+  assert.deepEqual(rows(posts), [
+    { label: "Principles · p 1", kind: "edited", before: "First card.", after: "First card, touched." },
+    { label: "Principles · p 3", kind: "edited", before: "Third card.", after: "Third card." },
+  ]);
+  assert.match(fullRows(posts)[1].after_html, /<i>card<\/i>/, "the formatting travels with its own block");
+});
+
+test("a line the user adds gets a label of its own and says where it sits; deleting it again leaves no row", { skip }, async () => {
+  const { window, document, posts, fromChrome, shadow } = await bootSdk(
+    "<h2>Not</h2><ul><li>No game files.</li><li>Other people's work.</li></ul>"
+  );
+  const [first] = document.querySelectorAll("li");
+  // Enter at the start of the first item: an empty item appears above it.
+  keystroke(window, [first.firstChild, 0], () => {
+    first.before(document.createElement("li"));
+    return [first.firstChild, 0];
+  });
+  const added = document.querySelector("li");
+  typeInto(window, added, "Not a ROM site.");
+  fromChrome({ type: "eh:flush" });
+  const row = fullRows(posts).find((r) => r.after === "Not a ROM site.");
+  assert.equal(row.label, "Not · new li");
+  assert.equal(row.before, undefined);
+  assert.equal(row.added, true);
+  assert.equal(row.added_after, "");
+  assert.equal(row.added_before, "No game files.");
+  assert.ok(!rows(posts).some((r) => r.label === "Not · li 1"), "the original first item is not reported");
+
+  deleteBlock(window, shadow, added);
+  fromChrome({ type: "eh:flush" });
+  assert.ok(!rows(posts).some((r) => r.kind === "deleted"), "no deleted row for a block the file never had");
+  assert.ok(posts.some((m) => m.type === "eh:dropEdit" && m.label === "Not · new li"), "its edited row is taken back");
+});
+
+test("Enter in the middle of a paragraph reports both halves", { skip }, async () => {
+  const { window, document, posts, fromChrome } = await bootSdk("<h2>Why</h2><p>Somewhere to find the content. Great sites exist.</p><p>Next.</p>");
+  const p = document.querySelector("p");
+  pressEnter(window, p, "Somewhere to find the content.".length + 1);
+  fromChrome({ type: "eh:flush" });
+  const got = fullRows(posts);
+  const first = got.find((r) => r.label === "Why · p 1");
+  const second = got.find((r) => r.label === "Why · new p");
+  assert.equal(first.before, "Somewhere to find the content. Great sites exist.");
+  assert.equal(first.after, "Somewhere to find the content. ", "the first half, not the text that moved on");
+  assert.equal(second.after, "Great sites exist.");
+  assert.equal(second.added_after, "Somewhere to find the content.");
+  assert.equal(second.added_before, "Next.");
+});
+
+test("Backspace at the start of a paragraph reports the merge, and the paragraph that went", { skip }, async () => {
+  const { window, document, posts, fromChrome } = await bootSdk("<h2>Plan</h2><p>One.</p><p>Two.</p><p>Three.</p>");
+  const [one, two] = document.querySelectorAll("p");
+  keystroke(window, [two.firstChild, 0], () => {
+    const caret = [one.firstChild, one.firstChild.length];
+    one.append(...two.childNodes);
+    two.remove();
+    return caret;
+  });
+  fromChrome({ type: "eh:flush" });
+  assert.deepEqual(rows(posts), [
+    { label: "Plan · p 1", kind: "edited", before: "One.", after: "One.Two." },
+    { label: "Plan · p 2", kind: "deleted", before: "Two.", after: "" },
+  ]);
+});
+
+test("Delete at the end of a paragraph reports the neighbour it swallowed", { skip }, async () => {
+  const { window, document, posts, fromChrome } = await bootSdk("<h2>Plan</h2><p>One.</p><p>Two.</p>");
+  const [one, two] = document.querySelectorAll("p");
+  keystroke(window, [one.firstChild, one.firstChild.length], () => {
+    const caret = [one.firstChild, one.firstChild.length];
+    one.append(...two.childNodes);
+    two.remove();
+    return caret;
+  });
+  fromChrome({ type: "eh:flush" });
+  assert.deepEqual(rows(posts), [
+    { label: "Plan · p 1", kind: "edited", before: "One.", after: "One.Two." },
+    { label: "Plan · p 2", kind: "deleted", before: "Two.", after: "" },
+  ]);
+});
+
+test("emptying a paragraph reports that paragraph, never a nameless 'Document body' row", { skip }, async () => {
+  const { window, document, posts, fromChrome } = await bootSdk("<h2>Plan</h2><p>Keep.</p><p>Remove every word.</p>");
+  const p = document.querySelectorAll("p")[1];
+  keystroke(window, [p.firstChild, 0], () => {
+    p.textContent = "";
+    return [p, 0];
+  });
+  fromChrome({ type: "eh:flush" });
+  assert.deepEqual(rows(posts), [{ label: "Plan · p 2", kind: "edited", before: "Remove every word.", after: "" }]);
+});
+
+test("deleting a retyped block reports its original text and takes back the edit; undo brings the edit back", { skip }, async () => {
+  const { window, document, posts, fromChrome, shadow } = await bootSdk("<h2>Plan</h2><p>Keep.</p><p>Original words.</p>");
+  const p = document.querySelectorAll("p")[1];
+  typeInto(window, p, "Retyped words.");
+  deleteBlock(window, shadow, p);
+  fromChrome({ type: "eh:flush" });
+  assert.deepEqual(rows(posts).filter((r) => r.kind === "deleted"), [{ label: "Plan · p 2", kind: "deleted", before: "Original words.", after: "" }]);
+  assert.ok(posts.some((m) => m.type === "eh:dropEdit" && m.label === "Plan · p 2"));
+
+  const sent = posts.length;
+  fromChrome({ type: "eh:undo", label: "Plan · p 2", kind: "deleted" });
+  fromChrome({ type: "eh:flush" });
+  assert.deepEqual(rows(posts.slice(sent)), [{ label: "Plan · p 2", kind: "edited", before: "Original words.", after: "Retyped words." }]);
+});
+
+test("a block the page renders after load is still reported when deleted", { skip }, async () => {
+  const { window, document, posts, fromChrome, shadow } = await bootSdk("<h2>Feed</h2><p>Loaded with the page.</p>");
+  const late = document.createElement("p");
+  late.textContent = "Rendered later by the page.";
+  document.querySelector("p").after(late);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  deleteBlock(window, shadow, late);
+  fromChrome({ type: "eh:flush" });
+  assert.deepEqual(rows(posts), [{ label: "Feed · p 2", kind: "deleted", before: "Rendered later by the page.", after: "" }]);
+});
+
+test("deleting a heading does not move the blocks under it into the section above", { skip }, async () => {
+  const { window, document, posts, shadow } = await bootSdk("<h2>Principles</h2><p>A.</p><h2>Slop</h2><p>B.</p><p>C.</p>");
+  const [, slop] = document.querySelectorAll("h2");
+  const c = document.querySelectorAll("p")[2];
+  deleteBlock(window, shadow, slop);
+  deleteBlock(window, shadow, c);
+  assert.deepEqual(rows(posts).map((r) => r.label), ["Slop", "Slop · p 2"]);
+});
+
+test("a heading's permalink is not part of its name", { skip }, async () => {
+  const { window, document, posts, shadow } = await bootSdk(
+    '<h2 id="tiers">Tiers<a href="#tiers" aria-label="Link to this section">#</a></h2><p>Every game has a tier.</p><h2>C#</h2><p>A language.</p>'
+  );
+  const [tiers] = document.querySelectorAll("h2");
+  const [first, second] = document.querySelectorAll("p");
+  deleteBlock(window, shadow, first);
+  deleteBlock(window, shadow, second);
+  deleteBlock(window, shadow, tiers);
+  assert.deepEqual(rows(posts).map((r) => r.label), ["Tiers · p", "C# · p", "Tiers"], "a # that is part of the words stays");
+});

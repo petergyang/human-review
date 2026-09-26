@@ -110,6 +110,25 @@ test("pasted images land in assets/ next to the reviewed file", async (t) => {
     assert.equal(row.moved_after, "Intro paragraph");
     assert.equal(row.moved_before, "Closing paragraph");
   });
+
+  await t.test("a block the user added keeps its position fields through the API", async () => {
+    const post = (added_after) =>
+      request(port, {
+        method: "POST",
+        route: `/api/page/${key}/edit`,
+        headers: { "x-human-review-token": token, "content-type": "application/json" },
+        body: JSON.stringify({ label: "Intro · new p", kind: "edited", after: "A new line.", added: true, added_after, added_before: "Closing paragraph" }),
+      });
+    await post("Intro paragraph");
+    // Typing on moves the block's row forward, position included.
+    const res = await post("Second paragraph");
+    assert.equal(res.status, 200);
+    const row = JSON.parse(res.raw).page.edits.find((e) => e.label === "Intro · new p");
+    assert.equal(row.added, true);
+    assert.equal(row.added_after, "Second paragraph");
+    assert.equal(row.added_before, "Closing paragraph");
+    assert.equal(row.before, undefined);
+  });
 });
 
 test("localhost image pastes are staged, previewed, and delivered to the agent", async (t) => {

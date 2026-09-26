@@ -156,6 +156,13 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   block whose text starts with `moved_before` (both are clipped to 90
   characters and may end in `…`). An empty `moved_after` means it is now the
   first block in its container.
+- An edit with `added: true` is a block the user created during the review
+  (Enter, paste). It has no `before`: insert it into the source right after the
+  block whose text starts with `added_after` and right before the block whose
+  text starts with `added_before` (both clipped to 90 characters; an empty
+  `added_after` means it is the first block in its container). Pressing Enter
+  mid-paragraph splits it: the original block's row carries the first half, and
+  the added block the rest.
 - Find each comment by its `quote`. It is the **rendered** text the user
   selected, so in Markdown or templated HTML it may span formatting syntax or
   tags; `anchor.prefix` and `anchor.suffix` give the surrounding text to
