@@ -467,8 +467,11 @@ export function createServer() {
       next_step:
         "Apply this feedback. Each entry in `pages` names the reviewed file or localhost URL. Items under `edits` are " +
         "changes the human already made: `after` is their exact new wording, so carry it across verbatim, and " +
-        "never revert it. When an edit carries `after_html`, the human changed formatting (bold, italic, links) — " +
-        "use the HTML version, translated into the source's own syntax. " +
+        "never revert it. First find each edit's `before` in the source: if it is not there, or `after` repeats " +
+        "another block's text, do not guess — apply the rest and tell the user which edits you left. " +
+        "When an edit carries `after_html`, the human changed formatting (bold, italic, links) — " +
+        "use the HTML version, translated into the source's own syntax, and keep the source's typography " +
+        "(curly quotes, spaces rather than non-breaking spaces). " +
         (hasSaved
           ? "Pages with `edits_saved: true` already contain those edits on disk: re-read the file before touching it and " +
             "make targeted changes only — never regenerate it from an older copy, or their work disappears. "

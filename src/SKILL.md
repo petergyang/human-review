@@ -123,6 +123,16 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   carry it across verbatim and never revert it. If the HTML was generated from
   something else (MDX, Markdown, a template), apply `after` to the **source** too,
   or their fix disappears on the next build.
+- **Check each row against the source before you apply it.** Find its `before` in
+  the block it names. If `before` is not there, or `after` repeats text that belongs
+  to a different block, the row does not describe what the user did: the source
+  changed since the page loaded, or the row names the wrong block. Do not guess.
+  Apply the rows that check out, and tell the user which ones you left and why.
+- **Keep the source's own typography.** Wording typed in a browser comes with
+  straight quotes and apostrophes, and sometimes a non-breaking space where the
+  user typed a space; match what the source already uses. Formatting that spills
+  past a word onto the punctuation or space after it (`<i>Title –&nbsp;</i>`) is
+  the editor's doing: keep it to the words, and mention it.
 - **`edits_saved: true` means those edits are already in the file on disk.**
   Plain HTML files autosave as the user types, so your copy of the file is
   stale. Re-read the file before touching it and make targeted changes only;
@@ -164,8 +174,11 @@ One batch covers every page the user visited, grouped by file or localhost URL.
 - Copy any `staged_assets` files before you ack: `--ack` deletes them.
 - A batch with only an `overall_note` has an empty `pages` array.
 - Fix every page in `pages`, not just the first.
-- **Do not write a reply.** There is no chat. The user sees your work when the page
-  reloads, which happens on its own the moment you save the file.
+- **Do not summarize the batch back.** The user sees your work when the page
+  reloads, which happens on its own the moment you save the file. Do tell them,
+  in a line or two, about any row you left unapplied or any call you had to make.
+  In a harness where they can message you while the review is open, answer
+  those messages as usual.
 
 ## Better edit labels (optional)
 

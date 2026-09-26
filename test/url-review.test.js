@@ -132,6 +132,7 @@ test("a localhost route is visually editable and returns source-directed feedbac
     ]
   );
   assert.match(batch.next_step, /Find the matching project source/);
+  assert.match(batch.next_step, /find each edit's `before` in the source/, "the agent checks rows before applying them");
 
   const redirect = await request(review.port, review.token, {
     method: "POST",

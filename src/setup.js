@@ -87,10 +87,14 @@ instantly whether feedback is already waiting, without blocking.
 The batch groups feedback by page under \`pages\`, so fix every page listed. Items
 under \`edits\` are changes the user already made: \`after\` is their exact wording,
 so carry it across verbatim and never revert it — and if the HTML was generated
-from MDX or Markdown, apply it to the source too. Markdown files open rendered
+from MDX or Markdown, apply it to the source too. First find each edit's \`before\`
+in the source: if it is not there, or \`after\` repeats another block's text, do
+not guess; apply the rest and tell the user which you left. Keep the source's
+typography (curly quotes, plain spaces). Markdown files open rendered
 and are never written by human-review: apply their comments and edits to the
-Markdown source, keeping its syntax. There is no reply channel; the user sees
-your work when the page reloads. For a localhost page, direct edits and deletions
+Markdown source, keeping its syntax. Do not summarize the batch back; the user
+sees your work when the page reloads, but do mention any edit you left
+unapplied. For a localhost page, direct edits and deletions
 arrive with \`kind: "url"\`; find and update the matching MDX, TSX, template, or
 component source. Never write the rendered HTTP response over project source.
 A page with \`edits_saved: true\` already has those edits on disk: re-read the
