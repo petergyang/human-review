@@ -20,5 +20,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      # The LaTeX tests render through pandoc and skip themselves without it.
+      - uses: pandoc/actions/setup@v1
       - run: npm ci
       - run: npm test

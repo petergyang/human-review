@@ -40,6 +40,14 @@ Open an HTML or Markdown file:
 /human-review (your file)
 ```
 
+Open a LaTeX paper (needs [pandoc](https://pandoc.org/installing.html) 2.15 or newer on your PATH):
+
+```text
+/human-review (main.tex)
+```
+
+The paper is rendered to HTML with math, citations, and `\input` sections in place. Your agent applies each comment to the matching `.tex` source, so you review in the browser and the manuscript stays LaTeX. Review it the way you would a Markdown file: the `.tex` files are never written by Human Review. TikZ figures and other raw LaTeX are not rendered, only their captions. `\input` files and `.bib` files are followed only inside the document's own folder, and editing any of them refreshes the page.
+
 Review a page running on localhost:
 
 ```text
@@ -50,7 +58,7 @@ Human Review opens the file in your browser. Make direct edits, leave comments, 
 
 In Claude Code, the agent waits in the background and picks up your feedback the moment you hit Send. In Codex and other agents, it waits during its turn; if the turn already ended, send a message and it picks the feedback up. Closing the tab or clicking End review releases the agent either way. Feedback you never sent is kept, and the next time you open that page you can restore or discard it.
 
-Note: For HTML files, direct edits and resizes save automatically, so closing the tab doesn't undo them — Discard on your next open, or Revert all during the review, puts the file back. For Markdown and localhost pages, click Send so your agent can apply them to the source.
+Note: For HTML files, direct edits and resizes save automatically, so closing the tab doesn't undo them — Discard on your next open, or Revert all during the review, puts the file back. For Markdown, LaTeX, and localhost pages, click Send so your agent can apply them to the source.
 
 ## What this skill lets you do
 
@@ -76,6 +84,7 @@ I use Human Review to edit AI-generated plans, update landing pages, review loca
 - [`sdk.js`](src/sdk.js) handles editing, comments, highlights, and feedback.
 - [`chrome-client.js`](src/chrome-client.js) contains the visual review interface.
 - [`markdown.js`](src/markdown.js) renders Markdown files for review.
+- [`latex.js`](src/latex.js) renders LaTeX files for review through pandoc.
 - [`SKILL.md`](src/SKILL.md) teaches Claude Code, Codex, and other agents how to use Human Review.
 
 Everything runs on your computer. Human Review doesn’t require an account, cloud service, database, or API key.

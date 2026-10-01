@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { atomicWrite, Store, resolveAsset } from "./state.js";
 import { injectSdk, stripSdk } from "./html-transform.js";
 import { isMarkdown, renderMarkdownPage } from "./markdown.js";
+import { isLatex, loadLatex, renderLatexPage } from "./latex.js";
 import { canonicalTarget, ensureStateDir, localUrl, SERVER_PROTOCOL, serverPath, stateDir, targetKey } from "./paths.js";
 import { invocation, shellQuote } from "./setup.js";
 
@@ -181,7 +182,9 @@ export function createServer() {
   const viewToken = crypto.randomBytes(8).toString("hex");
   /** The localhost page most recently served, for proxying its app's own requests. */
   let lastUrlPageKey = null;
-  const watched = new Map(); // key -> { file }
+  const watched = new Map(); // key -> { files }
+  /** Sources the review renders for reading: edits go to the agent, never to the file. */
+  const isRenderedSource = (file) => isMarkdown(file) || isLatex(file);
   const lastWritten = new Map(); // key -> content hash human-review itself wrote
 
   let lastActivity = Date.now();
@@ -307,12 +310,30 @@ export function createServer() {
     if (watched.has(key)) return;
     const page = store.page(key);
     if (!page || page.kind === "url") return;
-    watched.set(key, { file: page.file });
+    const entry = { files: [page.file] };
+    watched.set(key, entry);
 
-    fs.watchFile(page.file, { interval: WATCH_INTERVAL_MS }, () => {
+    // A LaTeX page is the whole document: a change to any \input file reloads
+    // it, and a newly included file starts being watched.
+    const follow = (source) => {
+      for (const file of source.files) {
+        if (entry.files.includes(file)) continue;
+        entry.files.push(file);
+        fs.watchFile(file, { interval: WATCH_INTERVAL_MS }, onChange);
+      }
+    };
+
+    const onChange = () => {
       let html = "";
       try {
-        html = fs.readFileSync(page.file, "utf8");
+        if (isLatex(page.file)) {
+          const source = loadLatex(page.file);
+          // Changes to a section or a .bib file must read as a change.
+          html = source.fingerprint;
+          follow(source);
+        } else {
+          html = fs.readFileSync(page.file, "utf8");
+        }
       } catch {
         return;
       }
@@ -320,11 +341,20 @@ export function createServer() {
       // Our own autosave must never bounce back as a reload.
       if (lastWritten.get(key) === current) return;
       lastWritten.set(key, current);
-      // Rows on a Markdown or self-rendering page are unsent feedback, not
-      // something this write already contains; keep them.
-      store.setPristine(key, html, { keepEdits: isMarkdown(page.file) || !!store.page(key)?.dynamic });
+      // Rows on a Markdown, LaTeX, or self-rendering page are unsent feedback,
+      // not something this write already contains; keep them.
+      store.setPristine(key, html, { keepEdits: isRenderedSource(page.file) || !!store.page(key)?.dynamic });
       for (const session of sessionsForKey(key)) emit(session, "reload", { key });
-    });
+    };
+
+    fs.watchFile(page.file, { interval: WATCH_INTERVAL_MS }, onChange);
+    if (isLatex(page.file)) {
+      try {
+        follow(loadLatex(page.file));
+      } catch {
+        // The main file's own watcher reports it once it can be read.
+      }
+    }
   }
 
   function writePage(key, html) {
@@ -383,15 +413,17 @@ export function createServer() {
       const edits = page.edits.filter((e) => (e.updatedAt || e.at || 0) >= coveredUntil);
       if (!comments.length && !edits.length) continue;
       const markdown = page.kind !== "url" && isMarkdown(page.file);
+      const latex = page.kind !== "url" && isLatex(page.file);
       out.push({
         key,
         kind: page.kind === "url" ? "url" : "file",
         file: page.kind === "url" ? page.url : page.file,
         url: page.kind === "url" ? page.url : undefined,
         markdown,
+        latex,
         // Direct edits to a plain HTML file are autosaved into it as they
         // happen; everywhere else they exist only in this batch.
-        edits_saved: page.kind !== "url" && !markdown && !page.dynamic,
+        edits_saved: page.kind !== "url" && !markdown && !latex && !page.dynamic,
         comments: comments.map((c) => ({
           id: c.id,
           kind: c.kind,
@@ -448,16 +480,18 @@ export function createServer() {
     if (!pages.length && !note) return { error: inFlight ? "nothing new since the batch the agent is working on" : "nothing to send" };
 
     const hasMarkdown = pages.some((p) => p.markdown);
+    const hasLatex = pages.some((p) => p.latex);
     const hasUrl = pages.some((p) => p.kind === "url");
     const hasSaved = pages.some((p) => p.edits_saved && p.edits.length);
     const hasTruncated = pages.some((p) => p.edits.some((e) => e.truncated));
     const batch = {
       status: "feedback",
-      pages: pages.map(({ kind, file, url, markdown, edits_saved, comments, edits }) => ({
+      pages: pages.map(({ kind, file, url, markdown, latex, edits_saved, comments, edits }) => ({
         kind,
         file,
         ...(url ? { url } : {}),
         ...(markdown ? { markdown: true } : {}),
+        ...(latex ? { latex: true } : {}),
         edits_saved,
         comments,
         edits,
@@ -479,6 +513,12 @@ export function createServer() {
         (hasMarkdown
           ? "Markdown pages were reviewed rendered, so quotes and `after` wording use the rendered text — apply " +
             "the change to the Markdown source, keeping its formatting syntax. "
+          : "") +
+        (hasLatex
+          ? "LaTeX pages were reviewed as rendered HTML, so quotes and `after` wording use the rendered text — find " +
+            "that text in the `.tex` source (it may sit in an `\\input` file, and macros, math, and citations render " +
+            "differently from how they are written) and apply the change there, keeping the LaTeX markup. The " +
+            "review page re-renders when any source file changes. "
           : "") +
         (hasUrl
           ? "Localhost pages were edited directly in the review UI. Find the matching project source (such as MDX or TSX) " +
@@ -675,6 +715,7 @@ export function createServer() {
       ...(page.kind === "url" ? { url: page.url } : {}),
       filename: page.kind === "url" ? new URL(page.url).pathname || page.url : path.basename(page.file),
       markdown: page.kind !== "url" && isMarkdown(page.file),
+      latex: page.kind !== "url" && isLatex(page.file),
       feedbackOnly: page.kind === "url",
       comments: page.comments.map((c) => ({ ...c, sent: coverage.ids.has(c.id) })),
       edits: page.edits.map((e) => ({ ...e, sent: isSentEdit(e, coverage) })),
@@ -859,8 +900,16 @@ export function createServer() {
               res.writeHead(404, { "content-type": "text/plain" });
               return res.end("File is gone");
             }
-            // Markdown reviews render on the fly; the source file stays untouched.
+            // Markdown and LaTeX reviews render on the fly; the source stays untouched.
             if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
+            else if (isLatex(page.file)) {
+              try {
+                html = await renderLatexPage(page.file);
+              } catch (err) {
+                res.writeHead(502, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+                return res.end(`Could not render ${path.basename(page.file)}: ${err.message}`);
+              }
+            }
           }
           const headers = { "content-type": MIME[".html"], "cache-control": "no-store" };
           if (page.kind === "url") {
@@ -1046,7 +1095,7 @@ export function createServer() {
           const page = store.page(key);
           // On a plain HTML file the edits were autosaved into it; discarding
           // them means putting the agent's version back, not just dropping rows.
-          const reverted = page.kind !== "url" && !isMarkdown(page.file) && !page.dynamic && !!page.pristine;
+          const reverted = page.kind !== "url" && !isRenderedSource(page.file) && !page.dynamic && !!page.pristine;
           if (reverted) writePage(key, page.pristine);
           store.discardFeedback(key);
           for (const session of sessionsForKey(key)) emit(session, reverted ? "reload" : "refresh", reverted ? { key } : {});
@@ -1087,8 +1136,8 @@ export function createServer() {
         if (action === "save" && req.method === "POST") {
           const page = store.page(key);
           // Rendered sources must never be overwritten with serialized browser HTML.
-          if (page.kind === "url" || isMarkdown(page.file)) {
-            return json(res, 400, { error: page.kind === "url" ? "localhost edits must be applied to app source" : "markdown pages are feedback-only" });
+          if (page.kind === "url" || isRenderedSource(page.file)) {
+            return json(res, 400, { error: page.kind === "url" ? "localhost edits must be applied to app source" : "markdown and latex pages are feedback-only" });
           }
           const body = await readBody(req);
           if (typeof body.html !== "string" || !body.html.trim()) {
@@ -1119,6 +1168,14 @@ export function createServer() {
         if (action === "revert" && req.method === "POST") {
           const page = store.page(key);
           if (page.kind === "url") return json(res, 400, { error: "localhost pages have no directly writable file to revert" });
+          // Edits on a Markdown or LaTeX page were never written to its file, so
+          // there is nothing to put back. Writing `pristine` here would be wrong
+          // for LaTeX, where it holds the flattened document, not the source.
+          if (isRenderedSource(page.file)) {
+            store.clearEdits(key);
+            for (const session of sessionsForKey(key)) emit(session, "reload", { key });
+            return json(res, 200, { page: pageState(key) });
+          }
           if (!page.pristine) return json(res, 400, { error: "nothing to revert to" });
           writePage(key, page.pristine);
           store.clearEdits(key);
@@ -1200,8 +1257,8 @@ export function createServer() {
           return json(res, 200, { key: page.key, page: pageState(page.key) });
         }
         const targetFile = resolveAsset(from.file, String(body.href || "").split(/[?#]/)[0]);
-        if (!targetFile || !fs.existsSync(targetFile) || !/\.(x?html?|md|markdown)$/i.test(targetFile)) {
-          return json(res, 400, { error: "not a local html or markdown page" });
+        if (!targetFile || !fs.existsSync(targetFile) || !/\.(x?html?|md|markdown|tex)$/i.test(targetFile)) {
+          return json(res, 400, { error: "not a local html, markdown, or latex page" });
         }
         const page = openFile(targetFile);
         watchPage(page.key);
@@ -1312,7 +1369,7 @@ export function createServer() {
     for (const [key, entry] of watched) {
       const referenced = [...sessions.values()].some((s) => s.visited.has(key));
       if (!referenced) {
-        fs.unwatchFile(entry.file);
+        for (const file of entry.files) fs.unwatchFile(file);
         watched.delete(key);
         lastWritten.delete(key);
       }
@@ -1327,7 +1384,7 @@ export function createServer() {
 
   const dispose = () => {
     clearInterval(sweep);
-    for (const entry of watched.values()) fs.unwatchFile(entry.file);
+    for (const entry of watched.values()) for (const file of entry.files) fs.unwatchFile(file);
     watched.clear();
     server.close();
   };

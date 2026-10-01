@@ -455,7 +455,7 @@ function render() {
     const parts = [];
     if (leftover.comments) parts.push(`${leftover.comments} ${leftover.comments === 1 ? "comment" : "comments"}`);
     if (leftover.edits) parts.push(`${leftover.edits} ${leftover.edits === 1 ? "edit" : "edits"}`);
-    const savedNote = page.kind === "file" && !page.markdown ? " Text edits are already in the file; Discard puts the agent's version back." : "";
+    const savedNote = page.kind === "file" && !page.markdown && !page.latex ? " Text edits are already in the file; Discard puts the agent's version back." : "";
     $("leftoverText").textContent = `${parts.join(" and ")} from your last review never went to the agent.${savedNote}`;
   }
 
@@ -471,9 +471,9 @@ function renderSave() {
     $("saveText").textContent = "Localhost page — your direct edits go to the agent for source updates";
     return;
   }
-  if (state.page && state.page.markdown) {
+  if (state.page && (state.page.markdown || state.page.latex)) {
     line.className = "save-line dynamic";
-    $("saveText").textContent = "Markdown source — edits go to the agent as feedback";
+    $("saveText").textContent = `${state.page.latex ? "LaTeX" : "Markdown"} source — edits go to the agent as feedback`;
     return;
   }
   if (state.dynamic) {
@@ -693,7 +693,7 @@ window.addEventListener("message", async (event) => {
         toFrame({ type: "eh:restoreScroll", x: state.scroll.x, y: state.scroll.y });
         state.reloading = false;
       }
-      if (state.page && (state.page.markdown || state.page.feedbackOnly)) {
+      if (state.page && (state.page.markdown || state.page.latex || state.page.feedbackOnly)) {
         // Rendered sources are editable here but never serialized over their source.
         toFrame({ type: "eh:feedbackOnly" });
       } else {

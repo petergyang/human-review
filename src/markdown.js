@@ -7,7 +7,7 @@ export const isMarkdown = (file) => /\.(md|markdown)$/i.test(file);
  * Readable defaults for rendered Markdown. This HTML is a viewing surface
  * only — it is never written back to disk, so the styling can be opinionated.
  */
-const STYLE = `
+export const STYLE = `
   * { box-sizing: border-box; }
   body {
     margin: 0; background: #fdfcfa; color: #1b1a16;

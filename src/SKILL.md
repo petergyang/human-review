@@ -1,6 +1,6 @@
 ---
 name: human-review
-description: Open an HTML file, Markdown file, or localhost page in the browser so the user can edit text directly and leave comments on specific parts, then send all edits and comments back to you. Use after writing or updating something the user will read — specs, plans, reports, newsletter drafts, landing pages, slide decks, and locally running web pages.
+description: Open an HTML file, Markdown file, LaTeX (.tex) file, or localhost page in the browser so the user can edit text directly and leave comments on specific parts, then send all edits and comments back to you. Use after writing or updating something the user will read — specs, plans, reports, newsletter drafts, landing pages, slide decks, and locally running web pages.
 ---
 
 # human-review
@@ -12,9 +12,17 @@ Markdown files open rendered. Their quotes and edits reference the rendered text
 and the file itself is never touched — apply every change to the Markdown source,
 keeping its formatting syntax.
 
+LaTeX (`.tex`) files open the same way, rendered to HTML with [pandoc](https://pandoc.org)
+2.15 or newer (math as MathML, citations resolved from the document's `.bib` file, `\input` files
+spliced in). Open the **main** `.tex` file. Quotes and edits reference the rendered
+text, and the `.tex` files are never touched — apply every change to the LaTeX
+source, keeping its markup. Figures drawn in TikZ and other raw LaTeX are not
+rendered, only their captions. If pandoc is missing the page says so; tell the user to
+install it rather than falling back to another format.
+
 ## The loop
 
-1. Write or update the HTML or Markdown file, or start the local page being reviewed.
+1. Write or update the HTML, Markdown, or LaTeX file, or start the local page being reviewed.
 2. Open it for the user:
 
    ```sh
@@ -127,7 +135,7 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   Plain HTML files autosave as the user types, so your copy of the file is
   stale. Re-read the file before touching it and make targeted changes only;
   never regenerate it from what you wrote earlier, or their work disappears.
-  `edits_saved: false` (Markdown, localhost pages, self-rendering HTML) means the
+  `edits_saved: false` (Markdown, LaTeX, localhost pages, self-rendering HTML) means the
   edits exist only in this batch — apply them to the source yourself.
 - An edit with `kind: "deleted"` means the user removed that whole block:
   delete it from the source too, without asking why.
@@ -157,9 +165,12 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   characters and may end in `…`). An empty `moved_after` means it is now the
   first block in its container.
 - Find each comment by its `quote`. It is the **rendered** text the user
-  selected, so in Markdown or templated HTML it may span formatting syntax or
-  tags; `anchor.prefix` and `anchor.suffix` give the surrounding text to
-  disambiguate.
+  selected, so in Markdown, LaTeX, or templated HTML it may span formatting syntax,
+  macros, or tags; `anchor.prefix` and `anchor.suffix` give the surrounding text to
+  disambiguate. In LaTeX the text may live in an `\input` file, and rendered math
+  or citations (`(Smith 2020)`) are written as `$…$` or `\cite{…}` in the source.
+  After applying edits to a LaTeX project, recompile with the project's own
+  build command, since the review shows the pandoc rendering, not the PDF.
 - `kind: "element"` points at a whole block, so `quote` is its label, not body text.
 - Copy any `staged_assets` files before you ack: `--ack` deletes them.
 - A batch with only an `overall_note` has an empty `pages` array.
