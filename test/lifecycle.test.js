@@ -48,11 +48,11 @@ const j = (res) => JSON.parse(res.raw);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** A long-poll as the CLI issues it. `.settled` says whether the server answered yet. */
-function poll(port, token, target, { ack = false } = {}) {
+function poll(port, token, target, { ack = false, started = 0 } = {}) {
   const state = { settled: false, req: null };
   state.promise = new Promise((resolve, reject) => {
     const req = http.request(
-      { host: "127.0.0.1", port, path: `/api/poll?target=${encodeURIComponent(target)}${ack ? "&ack=1" : ""}`, headers: { "x-human-review-token": token } },
+      { host: "127.0.0.1", port, path: `/api/poll?target=${encodeURIComponent(target)}${ack ? "&ack=1" : ""}${started ? `&started=${started}` : ""}`, headers: { "x-human-review-token": token } },
       (res) => {
         let raw = "";
         res.setEncoding("utf8");
@@ -184,6 +184,26 @@ test("a newer poll for the same target supersedes the older one", async (t) => {
   const batch = await newer.promise;
   assert.equal(batch.status, "feedback");
   assert.equal(batch.pages[0].comments[0].feedback, "Only once");
+});
+
+test("an older poll reconnecting after a restart does not take the wait from a newer one", async (t) => {
+  const file = htmlFile("reconnect.html");
+  const { port, token, dispose } = await start(0);
+  t.after(() => dispose());
+  const opened = await open(port, token, file);
+  const now = Date.now();
+  // The newer poll command reaches the fresh server first...
+  const newer = poll(port, token, file, { started: now });
+  await sleep(30);
+  // ...then the older command, still retrying from before the restart.
+  const older = poll(port, token, file, { started: now - 60000 });
+  const answer = await older.promise;
+  assert.equal(answer.status, "superseded");
+  assert.equal(newer.settled, false, "the newer poll keeps waiting");
+  await comment(port, token, opened.key, "Alpha", "Still mine");
+  await send(port, token, opened.key, opened.sessionId);
+  const batch = await newer.promise;
+  assert.equal(batch.pages[0].comments[0].feedback, "Still mine");
 });
 
 test("sending while the agent works queues only the new items and one ack clears both", async (t) => {

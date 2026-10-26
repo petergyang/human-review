@@ -170,6 +170,7 @@ export function createServer() {
   const sessions = new Map(); // sessionId -> { id, entryKey, activeKey, visited, clients:Set<res>, lastSeen }
   /** Agent long-polls, keyed by the entry page they were started on. */
   const pollers = new Map(); // entryKey -> Set<{ res, timer }>
+  const newestPoll = new Map(); // entryKey -> start time of the newest poll command seen
   /** Pending batches awaiting --ack; mirrored to the store so they survive restarts. */
   const batches = new Map(
     Object.entries(store.allBatches()).map(([key, record]) => [
@@ -1258,8 +1259,15 @@ export function createServer() {
 
         res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         res.write(" ");
-        // One waiter per target: an older poll left behind by an earlier turn
-        // would otherwise take the next batch too, and apply it twice.
+        // One waiter per target, and it is the newest poll command. An older
+        // poll reconnecting after a server restart must not take the wait
+        // back from a newer one. Polls from CLIs that send no start time
+        // count as just started, as before.
+        const startedAt = Number(url.searchParams.get("started")) || Date.now();
+        if (startedAt < (newestPoll.get(entryKey) || 0)) return res.end(JSON.stringify(SUPERSEDED));
+        newestPoll.set(entryKey, startedAt);
+        // An older poll left behind by an earlier turn would otherwise take
+        // the next batch too, and apply it twice.
         releasePollers(entryKey, SUPERSEDED);
         const set = pollers.get(entryKey) || new Set();
         pollers.set(entryKey, set);

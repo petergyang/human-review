@@ -126,8 +126,11 @@ async function openCommand(input) {
  * One long-poll attempt. Resolves { kind: "data", raw } when the server
  * answers, or { kind: "timeout" } when the caller's deadline passes first.
  */
-function pollOnce(server, target, ack, timeoutMs) {
-  const query = `target=${encodeURIComponent(target)}${ack ? "&ack=1" : ""}`;
+function pollOnce(server, target, ack, timeoutMs, started) {
+  // `started` is when this poll command began. It stays the same across
+  // reconnects, so the server can tell an old poll coming back after a
+  // restart from a newer one that has already taken over.
+  const query = `target=${encodeURIComponent(target)}${ack ? "&ack=1" : ""}${started ? `&started=${started}` : ""}`;
   return new Promise((resolve, reject) => {
     let done = false;
     const settle = (fn, value) => {
@@ -221,7 +224,7 @@ async function pollCommand(input, { ack = false, timeoutSecs = 0 } = {}) {
     if (remaining <= 0) return timedOut();
     let result;
     try {
-      result = await pollOnce(server, target, ackPending, remaining);
+      result = await pollOnce(server, target, ackPending, remaining, started);
     } catch (err) {
       failures += 1;
       if (bounded && failures >= 3) break;
