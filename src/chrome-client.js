@@ -41,6 +41,10 @@ const state = {
   framePolicy: null,
   artifactToken: "",
   leftover: null,
+  composeMode: "agent",
+  profile: null,
+  showClosed: false,
+  threadAnchors: new Set(),
 };
 
 /**
@@ -145,6 +149,7 @@ async function loadPage(key, { reload = true } = {}) {
   state.framePolicy = framePolicy(state.page, ARTIFACT_ORIGIN);
   frame.setAttribute("sandbox", state.framePolicy.sandbox);
   state.orphans = new Set();
+  state.threadAnchors = new Set();
   state.compose = null;
   state.active = null;
   state.sent = false;
@@ -224,6 +229,14 @@ function render() {
     composeWrap.hidden = false;
     $("composeKind").textContent = state.compose.kind === "element" ? "Element" : "Selection";
     $("composeQuote").textContent = tidy(state.compose.quote, 260);
+    const shareable = canShare(state.compose);
+    const mode = composeModeFor(state.compose);
+    $("composeModes").hidden = !shareable;
+    for (const button of document.querySelectorAll("#composeModes .mode")) button.classList.toggle("on", button.dataset.mode === mode);
+    $("composeReplacement").hidden = mode !== "suggest";
+    $("askAgentRow").hidden = mode === "agent";
+    $("composeText").placeholder = mode === "agent" ? "What should change?" : mode === "suggest" ? "Why? (optional)" : "Comment for co-authors and agents";
+    $("composeAdd").firstChild.textContent = mode === "agent" ? "Add comment " : mode === "suggest" ? "Suggest " : "Comment ";
   } else {
     composeWrap.hidden = true;
     $("composeText").value = "";
@@ -320,6 +333,9 @@ function render() {
     list.append(card);
   }
 
+  renderThreads(page);
+  renderProfile(page);
+
   // --- your edits
   const box = $("editsBox");
   box.hidden = edits.length === 0;
@@ -406,7 +422,8 @@ function render() {
   // batch that is delivered or queued stay listed until the ack, marked sent.
   const otherTotal = others.reduce((sum, o) => sum + o.count, 0);
   const unsent = page.unsent || { comments: comments.length, edits: edits.length };
-  const total = unsent.comments + unsent.edits + otherTotal;
+  // Shared threads waiting on an agent go with the next Send until it acts.
+  const total = unsent.comments + unsent.edits + otherTotal + (page.agentThreads || 0);
   // An overall note is sendable on its own — the server already accepts
   // note-only batches; the button must not stay dead while one is typed.
   const hasNote = $("note").value.trim().length > 0;
@@ -455,7 +472,7 @@ function render() {
     const parts = [];
     if (leftover.comments) parts.push(`${leftover.comments} ${leftover.comments === 1 ? "comment" : "comments"}`);
     if (leftover.edits) parts.push(`${leftover.edits} ${leftover.edits === 1 ? "edit" : "edits"}`);
-    const savedNote = page.kind === "file" && !page.markdown ? " Text edits are already in the file; Discard puts the agent's version back." : "";
+    const savedNote = page.kind === "file" && !page.markdown && !page.latex ? " Text edits are already in the file; Discard puts the agent's version back." : "";
     $("leftoverText").textContent = `${parts.join(" and ")} from your last review never went to the agent.${savedNote}`;
   }
 
@@ -471,9 +488,9 @@ function renderSave() {
     $("saveText").textContent = "Localhost page — your direct edits go to the agent for source updates";
     return;
   }
-  if (state.page && state.page.markdown) {
+  if (state.page && (state.page.markdown || state.page.latex)) {
     line.className = "save-line dynamic";
-    $("saveText").textContent = "Markdown source — edits go to the agent as feedback";
+    $("saveText").textContent = `${state.page.latex ? "LaTeX" : "Markdown"} source — edits go to the agent as feedback`;
     return;
   }
   if (state.dynamic) {
@@ -519,7 +536,7 @@ function editComment(card, body, comment) {
         toast("The agent already has the old wording — this version ships with your next Send");
         // The retired id no longer marks anything; the new one takes over.
         toFrame({ type: "eh:remove", id: comment.id });
-        toFrame({ type: "eh:anchors", comments: state.page.comments });
+        toFrame({ type: "eh:anchors", comments: anchorsFor(state.page) });
       } else state.sent = false;
     } catch (err) {
       toast(err.message);
@@ -602,10 +619,16 @@ function setActive(id, scroll) {
 async function openCompose(detail) {
   if (state.compose && $("composeText").value.trim()) await commitCompose();
   state.compose = detail;
+  $("composeReplacement").value = detail.quote || "";
+  $("askAgent").checked = false;
   render();
   toFrame({ type: "eh:composeOpen" });
   $("composeText").value = "";
 }
+
+/** Shared threads anchor on quoted text in a file; element picks and localhost pages stay private. */
+const canShare = (compose) => !!(state.page && state.page.threads && compose && compose.kind === "selection" && compose.anchor && compose.anchor.quote);
+const composeModeFor = (compose) => (canShare(compose) ? state.composeMode : "agent");
 
 function cancelCompose() {
   if (!state.compose) return;
@@ -617,6 +640,7 @@ function cancelCompose() {
 async function commitCompose() {
   const compose = state.compose;
   const feedback = $("composeText").value.trim();
+  if (compose && composeModeFor(compose) !== "agent") return commitThread(compose, composeModeFor(compose), feedback);
   if (!compose || !feedback) return;
   const result = await api(`/api/page/${state.key}/comment`, {
     method: "POST",
@@ -628,6 +652,322 @@ async function commitCompose() {
   state.active = result.comment.id;
   state.sent = false;
   render();
+}
+
+async function commitThread(compose, mode, text) {
+  const replacement = $("composeReplacement").value;
+  if (mode === "comment" && !text) return;
+  if (mode === "suggest" && replacement === compose.quote) {
+    toast("Change the replacement text to suggest something");
+    return;
+  }
+  try {
+    const result = await api(`/api/page/${state.key}/thread`, {
+      method: "POST",
+      body: JSON.stringify({
+        kind: mode === "suggest" ? "suggestion" : "comment",
+        anchor: compose.anchor,
+        replacement,
+        body: text,
+        askAgent: $("askAgent").checked,
+      }),
+    });
+    toFrame({ type: "eh:cancel" });
+    state.compose = null;
+    state.page = result.page;
+    state.active = result.thread.id;
+    syncThreadAnchors();
+    render();
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+// ------------------------------------------------------------------ threads
+
+const isLive = (thread) => thread.status === "open" || thread.status === "accepted";
+const liveThreadIds = (page) => new Set(((page && page.threads) || []).filter(isLive).map((t) => t.id));
+
+/** Private feedback and live shared threads, as the SDK's anchor list. */
+function anchorsFor(page) {
+  const threads = ((page && page.threads) || []).filter(isLive);
+  return [
+    ...((page && page.comments) || []),
+    ...threads.map((t) => ({ id: t.id, kind: "selection", anchor: t.anchor, shared: t.kind, color: t.author.color })),
+  ];
+}
+
+/** Draw threads that became live and unwrap the ones that closed. */
+function syncThreadAnchors() {
+  const live = liveThreadIds(state.page);
+  for (const id of state.threadAnchors) if (!live.has(id)) toFrame({ type: "eh:remove", id });
+  state.threadAnchors = live;
+  toFrame({ type: "eh:anchors", comments: anchorsFor(state.page) });
+}
+
+async function threadAction(id, verb, payload = {}) {
+  try {
+    const result = await api(`/api/page/${state.key}/thread/${id}/${verb}`, { method: "POST", body: JSON.stringify(payload) });
+    state.page = result.page;
+    syncThreadAnchors();
+    render();
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+const STATUS_LABEL = {
+  comment: { open: "open", resolved: "resolved" },
+  suggestion: { open: "suggested", accepted: "accepted, to apply", rejected: "rejected", applied: "applied" },
+};
+
+/** What each state lets you do next; the server enforces the same rules. */
+const THREAD_ACTIONS = {
+  comment: { open: [["Resolve", "resolved"]], resolved: [["Reopen", "open"]] },
+  suggestion: {
+    open: [["Accept", "accepted"], ["Reject", "rejected"]],
+    accepted: [["Mark applied", "applied"], ["Reopen", "open"]],
+    rejected: [["Reopen", "open"]],
+    applied: [["Reopen", "open"]],
+  },
+};
+
+function authorName(author) {
+  const me = state.page && state.page.me;
+  const you = me && author.type === "human" && author.name === me.name ? " (you)" : "";
+  return `${author.name}${you}`;
+}
+
+function swatch(color) {
+  const dot = document.createElement("span");
+  dot.className = "swatch";
+  if (color) dot.style.background = color;
+  return dot;
+}
+
+function badge(text, extra = "") {
+  const el = document.createElement("span");
+  el.className = `badge${extra ? ` ${extra}` : ""}`;
+  el.textContent = text;
+  return el;
+}
+
+function threadCard(thread) {
+  const card = document.createElement("div");
+  card.className = `comment thread ${thread.kind}${state.active === thread.id ? " active" : ""}${isLive(thread) ? "" : " closed"}${thread.elsewhere ? " elsewhere" : ""}`;
+  card.dataset.id = thread.id;
+
+  const head = document.createElement("div");
+  head.className = "comment-head";
+  const who = document.createElement("span");
+  who.className = "who";
+  who.append(swatch(thread.author.color), authorName(thread.author));
+  if (thread.author.type === "agent") who.append(badge(thread.author.model ? `agent · ${thread.author.model}` : "agent", "agent"));
+  const sep = document.createElement("span");
+  sep.className = "sep";
+  sep.textContent = "·";
+  const when = document.createElement("span");
+  when.className = "when";
+  when.textContent = ago(Date.parse(thread.updated_at) || Date.now());
+  who.append(sep, when, badge((STATUS_LABEL[thread.kind] || {})[thread.status] || thread.status, `st-${thread.status}`));
+  if (thread.ask_agent && isLive(thread)) who.append(badge("agent asked", "agent"));
+  if (isLive(thread) && state.orphans.has(thread.id)) who.append(badge("orphaned"));
+  if (thread.conflict) who.append(badge("conflict", "conflict"));
+  // Where else this thread lives: another branch or pull request.
+  if (thread.branches && thread.branches.length) {
+    const label = thread.elsewhere ? `on ${thread.branches[0]}` : thread.updates_elsewhere ? `updated on ${thread.branches[0]}` : "";
+    if (label) {
+      const more = thread.branches.length > 1 ? ` +${thread.branches.length - 1}` : "";
+      const chip = badge(`${label}${more}`, "branch");
+      chip.title = `Also on: ${thread.branches.join(", ")}`;
+      who.append(chip);
+    }
+  }
+  const jump = document.createElement("button");
+  jump.type = "button";
+  jump.className = "jump";
+  jump.textContent = "Jump to";
+  jump.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setActive(thread.id, true);
+  });
+  head.append(who, jump);
+
+  const quote = document.createElement("p");
+  quote.className = "quote";
+  if (thread.author.color) quote.style.borderLeftColor = thread.author.color;
+  if (thread.kind === "suggestion") {
+    const del = document.createElement("del");
+    del.textContent = tidy(thread.anchor.quote, 140);
+    const ins = document.createElement("ins");
+    ins.textContent = tidy(thread.replacement, 140);
+    quote.append(del, " → ", ins);
+  } else {
+    quote.textContent = tidy(thread.anchor.quote, 140);
+  }
+
+  const msgs = document.createElement("div");
+  msgs.className = "msgs";
+  for (const message of thread.messages) {
+    const p = document.createElement("p");
+    p.className = "msg";
+    const name = document.createElement("span");
+    name.className = "msg-who";
+    name.append(swatch(message.author.color), message.author.type === "agent" ? `${message.author.name} (agent)` : authorName(message.author));
+    p.append(name, message.body);
+    msgs.append(p);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "thread-actions";
+  for (const [label, status] of ((THREAD_ACTIONS[thread.kind] || {})[thread.status] || [])) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn-ghost";
+    button.textContent = label;
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      threadAction(thread.id, "status", { status });
+    });
+    actions.append(button);
+  }
+  if (isLive(thread)) {
+    const ask = document.createElement("label");
+    ask.className = "ask-agent";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !!thread.ask_agent;
+    box.addEventListener("click", (event) => event.stopPropagation());
+    box.addEventListener("change", () => threadAction(thread.id, "ask", { ask: box.checked }));
+    ask.append(box, "Ask agent");
+    ask.addEventListener("click", (event) => event.stopPropagation());
+    actions.append(ask);
+  }
+
+  const reply = document.createElement("textarea");
+  reply.className = "reply";
+  reply.rows = 1;
+  reply.placeholder = "Reply…";
+  reply.addEventListener("click", (event) => event.stopPropagation());
+  reply.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Enter" && !event.shiftKey) {
+      if (isImeCommitEnter(event)) return;
+      event.preventDefault();
+      const body = reply.value.trim();
+      if (body) threadAction(thread.id, "reply", { body });
+    }
+  });
+
+  card.append(head, quote);
+  if (thread.conflict) {
+    const note = document.createElement("p");
+    note.className = "conflict-note";
+    const outcomes = (thread.conflict.outcomes || []).map((o) => `${o.by ? o.by.name : "someone"} ${o.status === "open" ? "reopened it" : `marked it ${o.status}`}`);
+    note.textContent = `Branches disagree: ${outcomes.join(", but ")}. Decide again below.`;
+    card.append(note);
+  }
+  if (thread.messages.length) card.append(msgs);
+  card.append(actions, reply);
+  card.addEventListener("click", () => setActive(thread.id, false));
+  return card;
+}
+
+// ------------------------------------------------------------------ profile
+
+/** The chip in the rail head shows who you are in shared threads. */
+function renderProfile(page) {
+  const me = page.me;
+  $("whoami").hidden = !me;
+  if (!me) return;
+  $("whoName").textContent = me.name;
+  $("whoSwatch").style.background = me.color || "";
+}
+
+async function openProfile() {
+  const box = $("profileBox");
+  if (!box.hidden) return closeProfile();
+  let data;
+  try {
+    data = await api("/api/profile");
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+  const me = (state.page && state.page.me) || {};
+  state.profile = { color: data.profile.color || me.color || data.palette[0], palette: data.palette };
+  $("profileName").value = data.profile.name || me.name || "";
+  renderSwatches();
+  box.hidden = false;
+  $("profileName").focus();
+  $("profileName").select();
+}
+
+function renderSwatches() {
+  const row = $("profileSwatches");
+  row.textContent = "";
+  for (const color of state.profile.palette) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.style.background = color;
+    button.title = color;
+    button.setAttribute("role", "radio");
+    button.setAttribute("aria-checked", String(color === state.profile.color));
+    button.className = color === state.profile.color ? "on" : "";
+    button.addEventListener("click", () => {
+      state.profile.color = color;
+      renderSwatches();
+    });
+    row.append(button);
+  }
+}
+
+function closeProfile() {
+  $("profileBox").hidden = true;
+  state.profile = null;
+}
+
+async function saveProfile() {
+  const name = $("profileName").value.trim();
+  if (!name) {
+    toast("Pick a name co-authors will recognise");
+    return;
+  }
+  try {
+    await api("/api/profile", { method: "POST", body: JSON.stringify({ name, color: state.profile.color }) });
+    closeProfile();
+    replacePage(state, await api(pageUrl(state.key, state.sessionId)));
+    render();
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+function renderThreads(page) {
+  const box = $("threadsBox");
+  box.hidden = !page.threads;
+  if (!page.threads) return;
+  const threads = page.threads;
+  const live = threads.filter(isLive);
+  const closed = threads.length - live.length;
+  $("threadCount").textContent = String(live.length);
+  const toggle = $("threadClosed");
+  toggle.hidden = closed === 0;
+  toggle.textContent = state.showClosed ? "Hide closed" : `Show closed (${closed})`;
+  $("threadEmpty").hidden = threads.length > 0;
+  // Keep a reply being typed: re-rendering would throw it away.
+  const typing = document.activeElement && document.activeElement.classList.contains("reply") ? document.activeElement.closest(".thread") : null;
+  const draft = typing ? { id: typing.dataset.id, value: document.activeElement.value } : null;
+  const list = $("threadList");
+  list.textContent = "";
+  for (const thread of state.showClosed ? threads : live) list.append(threadCard(thread));
+  if (draft) {
+    const input = list.querySelector(`.thread[data-id="${CSS.escape(draft.id)}"] textarea.reply`);
+    if (input) {
+      input.value = draft.value;
+      input.focus();
+    }
+  }
 }
 
 // -------------------------------------------------------------------- saving
@@ -688,12 +1028,14 @@ window.addEventListener("message", async (event) => {
 
   switch (msg.type) {
     case "eh:ready": {
-      toFrame({ type: "eh:anchors", comments: state.page ? state.page.comments : [] });
+      // A fresh document has no marks yet; every live thread gets drawn.
+      state.threadAnchors = liveThreadIds(state.page);
+      toFrame({ type: "eh:anchors", comments: anchorsFor(state.page) });
       if (state.reloading) {
         toFrame({ type: "eh:restoreScroll", x: state.scroll.x, y: state.scroll.y });
         state.reloading = false;
       }
-      if (state.page && (state.page.markdown || state.page.feedbackOnly)) {
+      if (state.page && (state.page.markdown || state.page.latex || state.page.feedbackOnly)) {
         // Rendered sources are editable here but never serialized over their source.
         toFrame({ type: "eh:feedbackOnly" });
       } else {
@@ -711,7 +1053,7 @@ window.addEventListener("message", async (event) => {
       await openCompose({ kind: msg.kind, quote: msg.quote, anchor: msg.anchor });
       break;
     case "eh:dismiss":
-      if (!$("composeText").value.trim()) cancelCompose();
+      if (!$("composeText").value.trim() && !(composeModeFor(state.compose) === "suggest" && $("composeReplacement").value !== state.compose.quote)) cancelCompose();
       break;
     case "eh:activate":
       setActive(msg.id, false);
@@ -828,13 +1170,60 @@ window.addEventListener("message", async (event) => {
 // ---------------------------------------------------------------- rail wiring
 
 $("composeAdd").addEventListener("click", commitCompose);
+for (const button of document.querySelectorAll("#composeModes .mode")) {
+  button.addEventListener("click", () => {
+    state.composeMode = button.dataset.mode;
+    render();
+    (state.composeMode === "suggest" ? $("composeReplacement") : $("composeText")).focus();
+  });
+}
+$("composeReplacement").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelCompose();
+  }
+});
+$("whoami").addEventListener("click", openProfile);
+$("profileSave").addEventListener("click", saveProfile);
+$("profileCancel").addEventListener("click", closeProfile);
+$("profileName").addEventListener("keydown", (event) => {
+  event.stopPropagation();
+  if (event.key === "Enter" && !isImeCommitEnter(event)) {
+    event.preventDefault();
+    saveProfile();
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeProfile();
+  }
+});
+$("threadFetch").addEventListener("click", async () => {
+  const button = $("threadFetch");
+  button.disabled = true;
+  button.textContent = "Fetching…";
+  try {
+    state.page = (await api(`/api/page/${state.key}/thread/fetch`, { method: "POST", body: "{}" })).page;
+    syncThreadAnchors();
+    render();
+    toast("Fetched: threads from other branches are up to date");
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Fetch";
+  }
+});
+$("threadClosed").addEventListener("click", () => {
+  state.showClosed = !state.showClosed;
+  render();
+});
 $("composeCancel").addEventListener("click", cancelCompose);
 
 // Clicking anywhere on the card is the "I meant to comment" gesture.
 $("compose").addEventListener("mousedown", (event) => {
   // The textarea handles its own clicks — swallowing them would pin the caret
   // to the end and make repositioning it impossible.
-  if (event.target.closest("button, textarea")) return;
+  if (event.target.closest("button, textarea, input, label")) return;
   event.preventDefault();
   $("composeText").focus();
 });
@@ -1052,6 +1441,16 @@ function connect() {
   });
   source.addEventListener("agent", (event) => {
     state.agent = JSON.parse(event.data).state;
+    render();
+  });
+  // A thread changed: this browser, an agent's CLI, or a git pull.
+  source.addEventListener("threads", async () => {
+    try {
+      replacePage(state, await api(pageUrl(state.key, state.sessionId)));
+    } catch {
+      return;
+    }
+    syncThreadAnchors();
     render();
   });
   source.addEventListener("refresh", async () => {

@@ -40,6 +40,14 @@ Open an HTML or Markdown file:
 /human-review (your file)
 ```
 
+Open a LaTeX paper (needs [pandoc](https://pandoc.org/installing.html) 2.15 or newer on your PATH):
+
+```text
+/human-review (main.tex)
+```
+
+The paper is rendered to HTML with math, citations, and `\input` sections in place. Your agent applies each comment to the matching `.tex` source, so you review in the browser and the manuscript stays LaTeX. Review it the way you would a Markdown file: the `.tex` files are never written by Human Review. TikZ figures and other raw LaTeX are not rendered, only their captions. `\input` files and `.bib` files are followed only inside the document's own folder, and editing any of them refreshes the page.
+
 Review a page running on localhost:
 
 ```text
@@ -50,7 +58,7 @@ Human Review opens the file in your browser. Make direct edits, leave comments, 
 
 In Claude Code, the agent waits in the background and picks up your feedback the moment you hit Send. In Codex and other agents, it waits during its turn; if the turn already ended, send a message and it picks the feedback up. Closing the tab or clicking End review releases the agent either way. Feedback you never sent is kept, and the next time you open that page you can restore or discard it.
 
-Note: For HTML files, direct edits and resizes save automatically, so closing the tab doesn't undo them — Discard on your next open, or Revert all during the review, puts the file back. For Markdown and localhost pages, click Send so your agent can apply them to the source.
+Note: For HTML files, direct edits and resizes save automatically, so closing the tab doesn't undo them — Discard on your next open, or Revert all during the review, puts the file back. For Markdown, LaTeX, and localhost pages, click Send so your agent can apply them to the source.
 
 ## What this skill lets you do
 
@@ -66,8 +74,42 @@ Note: For HTML files, direct edits and resizes save automatically, so closing th
 - **Edit a comment** after writing it, even one already sent — a reworded comment reaches the agent with the next Send.
 - **Command-click links** to review multiple pages without losing your feedback.
 - **Send every edit and comment at once** instead of writing a long chat message.
+- **Discuss with co-authors and agents** — switch a comment to *Comment* or *Suggest* to make it a shared thread that everyone reviewing the file can reply to, resolve, or accept (see below).
 
 I use Human Review to edit AI-generated plans, update landing pages, review localhost apps, and remove the extra copy AI likes to add to UX.
+
+## Shared threads: reviewing with co-authors and agents
+
+Private comments go only to your own agent. **Shared threads** are for everyone
+who reviews the same file — people and agents alike:
+
+- Select text, then pick **Comment** for a discussion or **Suggest** to propose
+  replacement text. Others reply, resolve comments, and accept or reject
+  suggestions in the *Discussion* section of the rail.
+- Tick **Ask an agent** to put a thread on an agent's list. It arrives with your
+  next Send, and the agent answers in the thread. Accepted suggestions are
+  applied to the source by an agent, which then marks them applied.
+- Click your name at the top of the rail to choose the **name and highlight
+  colour** co-authors see on your threads (`human-review profile` does the same
+  from a terminal). Each reviewer's threads tint the page in their colour.
+- Agents take part through the CLI (`human-review threads`, `comment`, `suggest`,
+  `reply`, `accept`, `applied`, …; run `human-review --help`), signed with their
+  name and model.
+
+Threads are stored next to the file, one JSON file per thread, in
+`<file>.review/` — commit that folder and co-authors see each other's threads
+after a `git pull`. Nothing leaves your machine except through your own git
+remote. Your name comes from your profile, else `git config user.name`.
+
+**Across pull requests.** The Discussion also shows threads from other branches
+you have fetched (click **Fetch**), marked with their branch, so co-authors on
+separate pull requests see each other's comments before anything is merged.
+Replying to one brings it onto your branch. Run `human-review setup --git` once
+per clone (and commit the `.gitattributes` line it adds) so git merges thread
+files instead of conflicting: both sides' replies are kept, and if two branches
+made different decisions on a suggestion, it reopens with a note naming both
+for the authors to settle. `human-review fix-threads` repairs thread files a
+merge already left with conflict markers.
 
 ## What’s inside
 
@@ -76,6 +118,8 @@ I use Human Review to edit AI-generated plans, update landing pages, review loca
 - [`sdk.js`](src/sdk.js) handles editing, comments, highlights, and feedback.
 - [`chrome-client.js`](src/chrome-client.js) contains the visual review interface.
 - [`markdown.js`](src/markdown.js) renders Markdown files for review.
+- [`latex.js`](src/latex.js) renders LaTeX files for review through pandoc.
+- [`threads.js`](src/threads.js) stores shared threads beside the reviewed file, [`thread-cli.js`](src/thread-cli.js) gives agents and people the thread commands, and [`thread-git.js`](src/thread-git.js) merges threads across branches.
 - [`SKILL.md`](src/SKILL.md) teaches Claude Code, Codex, and other agents how to use Human Review.
 
 Everything runs on your computer. Human Review doesn’t require an account, cloud service, database, or API key.

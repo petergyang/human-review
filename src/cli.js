@@ -5,7 +5,9 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { canonicalTarget, ensureStateDir, SERVER_PROTOCOL, serverPath, statePath, targetKey } from "./paths.js";
-import { installSkills, shellQuote } from "./setup.js";
+import { installSkills, invocation, shellQuote } from "./setup.js";
+import { setupGit } from "./thread-git.js";
+import { runThreadCommand, THREAD_COMMANDS, THREAD_HELP } from "./thread-cli.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "utf8"));
@@ -19,7 +21,7 @@ const HELP = `human-review ${pkg.version}
   human-review status <target>        Report whether feedback is waiting, without blocking
   human-review setup                  Teach Claude Code / Codex how to use human-review
   human-review setup --global         ...for every project, not just this one
-
+${THREAD_HELP}
 Everything runs locally. No account, no cloud, no database.
 `;
 
@@ -341,9 +343,12 @@ try {
     const file = argv.find((a, i) => i > 0 && !a.startsWith("-"));
     if (!file) throw new Error("Usage: human-review status <file-or-localhost-url>");
     await statusCommand(file);
+  } else if (THREAD_COMMANDS.has(argv[0])) {
+    await runThreadCommand(argv);
   } else if (argv[0] === "setup") {
     const isGlobal = argv.includes("--global") || argv.includes("-g");
-    installSkills(process.cwd(), { global: isGlobal }).forEach((line) => console.log(line));
+    if (argv.includes("--git")) setupGit(process.cwd(), invocation()).forEach((line) => console.log(line));
+    else installSkills(process.cwd(), { global: isGlobal }).forEach((line) => console.log(line));
   } else {
     await openCommand(argv[0]);
   }

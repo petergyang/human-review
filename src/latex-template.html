@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$pagetitle$</title>
+</head>
+<body><main>
+$if(title)$<h1 class="title">$title$</h1>
+$endif$$for(author)$<p class="author">$author$</p>
+$endfor$$if(abstract)$<section class="abstract"><h2>Abstract</h2>
+$abstract$
+</section>
+$endif$$body$
+</main></body>
+</html>

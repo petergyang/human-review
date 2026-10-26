@@ -503,3 +503,79 @@ body.collapsed .handle { right: 0; }
 .badge.sent { background: var(--soft); color: var(--green); }
 .edit-row.sent { opacity: .55; }
 .edit-row.sent .pip { background: var(--green); }
+
+/* Shared threads: comments and suggestions everyone reviewing the file sees. */
+#threadsBox { margin-top: 20px; }
+.modes { display: flex; gap: 4px; margin: 0 0 9px; }
+.mode {
+  padding: 3px 9px;
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--mute);
+  font-size: 11px;
+  cursor: pointer;
+}
+.mode:hover { color: var(--strong-txt); }
+.mode.on { border-color: var(--btn-bg); background: var(--btn-bg); color: var(--btn-fg); }
+#composeReplacement { margin-bottom: 7px; }
+.ask-agent { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--mute); font-size: 11.5px; cursor: pointer; }
+.thread .quote { border-left-color: rgba(70, 130, 230, 0.7); }
+.thread.suggestion .quote { border-left-color: rgba(60, 160, 90, 0.75); font-style: normal; }
+.thread .quote del { color: var(--danger); }
+.thread .quote ins { color: var(--green); text-decoration: none; font-weight: 500; }
+.thread.active { box-shadow: inset 2px 0 0 rgba(70, 130, 230, 0.9); }
+.thread.closed { opacity: 0.62; }
+.badge.st-accepted { color: var(--green); }
+.badge.st-rejected { color: var(--danger); }
+.badge.agent { color: var(--amber); }
+.msgs { display: flex; flex-direction: column; gap: 6px; margin: 0 0 9px; }
+.msg { margin: 0; color: var(--txt); font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg .msg-who { margin-right: 6px; color: var(--mute); font-size: 11px; font-weight: 600; }
+.thread-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
+.thread-actions .btn-ghost { padding: 3px 8px; border: 1px solid var(--hair); font-size: 11px; }
+.thread-actions .ask-agent { margin: 0 0 0 auto; }
+.thread textarea.reply {
+  width: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  background: var(--input-bg);
+  color: var(--txt);
+  font-size: 12.5px;
+  line-height: 1.45;
+  resize: none;
+  outline: none;
+}
+.thread textarea.reply:focus { border-color: var(--focus); background: var(--card); }
+
+/* Reviewer identity: a name and a highlight colour, shared with co-authors. */
+.whoami {
+  display: flex; align-items: center; gap: 5px; margin-left: auto;
+  padding: 2px 8px; border: 1px solid var(--hair); border-radius: 999px;
+  background: transparent; color: var(--mute); font-size: 11px; cursor: pointer;
+  max-width: 150px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.whoami:hover { color: var(--strong-txt); border-color: var(--focus); }
+.whoami:not([hidden]) + .icon-btn { margin-left: 0; }
+.swatch { display: inline-block; flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
+.profile input[type="text"] {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--hair); border-radius: 6px;
+  background: var(--input-bg); color: var(--txt); font-size: 13px; outline: none;
+}
+.profile input[type="text"]:focus { border-color: var(--focus); background: var(--card); }
+.swatches { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+.swatches button {
+  width: 22px; height: 22px; padding: 0; border: 2px solid transparent; border-radius: 50%;
+  box-shadow: inset 0 0 0 2px var(--card); cursor: pointer;
+}
+.swatches button.on { border-color: var(--strong-txt); }
+.thread .who .swatch { margin-right: 5px; vertical-align: 0; }
+.msg .msg-who .swatch { width: 7px; height: 7px; margin-right: 4px; }
+
+/* Threads from other branches (open pull requests) and merge disagreements. */
+#threadClosed:not([hidden]) + #threadFetch { margin-left: 8px; }
+.thread.elsewhere { border-style: dashed; }
+.badge.branch { color: var(--mute); font-weight: 500; }
+.badge.conflict { background: var(--danger-soft); color: var(--danger); }
+.conflict-note { margin: 0 0 9px; padding: 7px 9px; border-radius: 6px; background: var(--danger-soft); color: var(--danger); font-size: 11.5px; line-height: 1.45; }

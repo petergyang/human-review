@@ -6,6 +6,22 @@ import { fileURLToPath } from "node:url";
 import { atomicWrite, Store, resolveAsset } from "./state.js";
 import { injectSdk, stripSdk } from "./html-transform.js";
 import { isMarkdown, renderMarkdownPage } from "./markdown.js";
+import { isLatex, loadLatex, renderLatexPage } from "./latex.js";
+import {
+  agentWork,
+  createThread,
+  humanAuthor,
+  listThreads,
+  PALETTE,
+  readProfile,
+  replyToThread,
+  setAskAgent,
+  setThreadStatus,
+  threadsSignature,
+  withColors,
+  writeProfile,
+} from "./threads.js";
+import { adoptThread, combinedThreads, fetchRemotes, refsStamp } from "./thread-git.js";
 import { canonicalTarget, ensureStateDir, localUrl, SERVER_PROTOCOL, serverPath, stateDir, targetKey } from "./paths.js";
 import { invocation, shellQuote } from "./setup.js";
 
@@ -36,6 +52,8 @@ const MIME = {
 const MAX_BODY = 24 * 1024 * 1024;
 const POLL_HEARTBEAT_MS = 15000;
 const WATCH_INTERVAL_MS = 400;
+// How often open pages check their shared-thread folder for outside writes.
+const THREAD_WATCH_MS = Number(process.env.HUMAN_REVIEW_THREAD_WATCH_MS || 1500);
 const IDLE_SHUTDOWN_MS = Number(process.env.HUMAN_REVIEW_IDLE_MS || 45 * 60 * 1000);
 /** A window with no live connection this long is treated as closed for good. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
@@ -181,7 +199,9 @@ export function createServer() {
   const viewToken = crypto.randomBytes(8).toString("hex");
   /** The localhost page most recently served, for proxying its app's own requests. */
   let lastUrlPageKey = null;
-  const watched = new Map(); // key -> { file }
+  const watched = new Map(); // key -> { files }
+  /** Sources the review renders for reading: edits go to the agent, never to the file. */
+  const isRenderedSource = (file) => isMarkdown(file) || isLatex(file);
   const lastWritten = new Map(); // key -> content hash human-review itself wrote
 
   let lastActivity = Date.now();
@@ -226,6 +246,18 @@ export function createServer() {
   function broadcastAgent(entryKey) {
     const state = agentState(entryKey);
     for (const session of sessionsForEntry(entryKey)) emit(session, "agent", { state });
+  }
+
+  /**
+   * Shared threads change from three places: this browser, an agent's CLI
+   * write, and a `git pull`. The last fingerprint seen per page lets the
+   * watcher tell them apart from no change at all.
+   */
+  const threadSigs = new Map();
+  function notifyThreads(key) {
+    const page = store.page(key);
+    if (page && page.kind !== "url") threadSigs.set(key, threadsSignature(page.file) + refsStamp(page.file));
+    for (const session of sessionsForKey(key)) emit(session, "threads", { key });
   }
 
   /**
@@ -307,12 +339,30 @@ export function createServer() {
     if (watched.has(key)) return;
     const page = store.page(key);
     if (!page || page.kind === "url") return;
-    watched.set(key, { file: page.file });
+    const entry = { files: [page.file] };
+    watched.set(key, entry);
 
-    fs.watchFile(page.file, { interval: WATCH_INTERVAL_MS }, () => {
+    // A LaTeX page is the whole document: a change to any \input file reloads
+    // it, and a newly included file starts being watched.
+    const follow = (source) => {
+      for (const file of source.files) {
+        if (entry.files.includes(file)) continue;
+        entry.files.push(file);
+        fs.watchFile(file, { interval: WATCH_INTERVAL_MS }, onChange);
+      }
+    };
+
+    const onChange = () => {
       let html = "";
       try {
-        html = fs.readFileSync(page.file, "utf8");
+        if (isLatex(page.file)) {
+          const source = loadLatex(page.file);
+          // Changes to a section or a .bib file must read as a change.
+          html = source.fingerprint;
+          follow(source);
+        } else {
+          html = fs.readFileSync(page.file, "utf8");
+        }
       } catch {
         return;
       }
@@ -320,11 +370,20 @@ export function createServer() {
       // Our own autosave must never bounce back as a reload.
       if (lastWritten.get(key) === current) return;
       lastWritten.set(key, current);
-      // Rows on a Markdown or self-rendering page are unsent feedback, not
-      // something this write already contains; keep them.
-      store.setPristine(key, html, { keepEdits: isMarkdown(page.file) || !!store.page(key)?.dynamic });
+      // Rows on a Markdown, LaTeX, or self-rendering page are unsent feedback,
+      // not something this write already contains; keep them.
+      store.setPristine(key, html, { keepEdits: isRenderedSource(page.file) || !!store.page(key)?.dynamic });
       for (const session of sessionsForKey(key)) emit(session, "reload", { key });
-    });
+    };
+
+    fs.watchFile(page.file, { interval: WATCH_INTERVAL_MS }, onChange);
+    if (isLatex(page.file)) {
+      try {
+        follow(loadLatex(page.file));
+      } catch {
+        // The main file's own watcher reports it once it can be read.
+      }
+    }
   }
 
   function writePage(key, html) {
@@ -381,17 +440,22 @@ export function createServer() {
       const coveredUntil = covered.reduce((max, entry) => Math.max(max, entry.sentAt || 0), 0);
       const comments = page.comments.filter((c) => !coveredIds.has(c.id));
       const edits = page.edits.filter((e) => (e.updatedAt || e.at || 0) >= coveredUntil);
-      if (!comments.length && !edits.length) continue;
+      // Shared threads waiting on an agent ride along until an agent acts on
+      // them; they are cleared by that action, never by an ack.
+      const threads = page.kind === "url" ? [] : agentWork(listThreads(page.file));
+      if (!comments.length && !edits.length && !threads.length) continue;
       const markdown = page.kind !== "url" && isMarkdown(page.file);
+      const latex = page.kind !== "url" && isLatex(page.file);
       out.push({
         key,
         kind: page.kind === "url" ? "url" : "file",
         file: page.kind === "url" ? page.url : page.file,
         url: page.kind === "url" ? page.url : undefined,
         markdown,
+        latex,
         // Direct edits to a plain HTML file are autosaved into it as they
         // happen; everywhere else they exist only in this batch.
-        edits_saved: page.kind !== "url" && !markdown && !page.dynamic,
+        edits_saved: page.kind !== "url" && !markdown && !latex && !page.dynamic,
         comments: comments.map((c) => ({
           id: c.id,
           kind: c.kind,
@@ -409,6 +473,17 @@ export function createServer() {
           ...(e.kind === "moved" ? { moved_after: e.moved_after || "", moved_before: e.moved_before || "" } : {}),
           ...(Array.isArray(e.staged_assets) && e.staged_assets.length ? { staged_assets: e.staged_assets } : {}),
           ...(e.truncated ? { truncated: true } : {}),
+        })),
+        threads: threads.map((t) => ({
+          id: t.id,
+          kind: t.kind,
+          status: t.status,
+          ask_agent: !!t.ask_agent,
+          quote: t.anchor.quote,
+          anchor: t.anchor,
+          ...(t.kind === "suggestion" ? { replacement: t.replacement } : {}),
+          author: t.author,
+          messages: t.messages.map((m) => ({ author: m.author, body: m.body, at: m.at })),
         })),
       });
     }
@@ -448,19 +523,23 @@ export function createServer() {
     if (!pages.length && !note) return { error: inFlight ? "nothing new since the batch the agent is working on" : "nothing to send" };
 
     const hasMarkdown = pages.some((p) => p.markdown);
+    const hasLatex = pages.some((p) => p.latex);
     const hasUrl = pages.some((p) => p.kind === "url");
     const hasSaved = pages.some((p) => p.edits_saved && p.edits.length);
     const hasTruncated = pages.some((p) => p.edits.some((e) => e.truncated));
+    const hasThreads = pages.some((p) => p.threads.length);
     const batch = {
       status: "feedback",
-      pages: pages.map(({ kind, file, url, markdown, edits_saved, comments, edits }) => ({
+      pages: pages.map(({ kind, file, url, markdown, latex, edits_saved, comments, edits, threads }) => ({
         kind,
         file,
         ...(url ? { url } : {}),
         ...(markdown ? { markdown: true } : {}),
+        ...(latex ? { latex: true } : {}),
         edits_saved,
         comments,
         edits,
+        ...(threads.length ? { threads } : {}),
       })),
       overall_note: note || "",
       sent_at: new Date().toISOString(),
@@ -480,11 +559,26 @@ export function createServer() {
           ? "Markdown pages were reviewed rendered, so quotes and `after` wording use the rendered text — apply " +
             "the change to the Markdown source, keeping its formatting syntax. "
           : "") +
+        (hasLatex
+          ? "LaTeX pages were reviewed as rendered HTML, so quotes and `after` wording use the rendered text — find " +
+            "that text in the `.tex` source (it may sit in an `\\input` file, and macros, math, and citations render " +
+            "differently from how they are written) and apply the change there, keeping the LaTeX markup. The " +
+            "review page re-renders when any source file changes. "
+          : "") +
         (hasUrl
           ? "Localhost pages were edited directly in the review UI. Find the matching project source (such as MDX or TSX) " +
             "and apply every exact edit or deletion there; never try to write the rendered HTML response back to the app. " +
             "When an edit includes `staged_assets`, copy each local image into the app's appropriate asset folder, replace its " +
             "temporary preview URL in `after_html`, and preserve the image at the user's insertion point. "
+          : "") +
+        (hasThreads
+          ? "Items under `threads` are shared review threads that co-authors and other agents also see; they are " +
+            "stored beside the file and change only through the CLI. An open thread with `ask_agent: true` is a " +
+            "question or request for you: do what it asks in the source, then answer it with `" + cliInvocation +
+            " reply <file> <id> --agent <your name> --model <model id> --body <answer>`. A `suggestion` with " +
+            "`status: accepted` must be applied: replace its quoted text (rendered text, like edits) with " +
+            "`replacement` in the source, then run `" + cliInvocation + " applied <file> <id> --agent <your name>`. " +
+            "Never edit the `.review` folder by hand. "
           : "") +
         "When every page is updated, run the same poll command again with --ack to clear this " +
         "batch and wait for more.",
@@ -660,6 +754,19 @@ export function createServer() {
   // from the review shell, so its SDK module needs CORS to load.
   const CORS = { "access-control-allow-origin": "*" };
 
+  /** Shared threads live beside the file; a localhost route has nowhere to keep them. */
+  function threadFields(file) {
+    // Other branches (open pull requests) are folded in for reading; agent work
+    // stays this branch's own, since that is where an agent would act.
+    let threads;
+    try {
+      threads = combinedThreads(file);
+    } catch {
+      threads = listThreads(file);
+    }
+    return { threads: threads.map(withColors), me: humanAuthor(file), agentThreads: agentWork(listThreads(file)).length };
+  }
+
   function pageState(key, session) {
     const page = store.page(key);
     if (!page) return null;
@@ -675,6 +782,7 @@ export function createServer() {
       ...(page.kind === "url" ? { url: page.url } : {}),
       filename: page.kind === "url" ? new URL(page.url).pathname || page.url : path.basename(page.file),
       markdown: page.kind !== "url" && isMarkdown(page.file),
+      latex: page.kind !== "url" && isLatex(page.file),
       feedbackOnly: page.kind === "url",
       comments: page.comments.map((c) => ({ ...c, sent: coverage.ids.has(c.id) })),
       edits: page.edits.map((e) => ({ ...e, sent: isSentEdit(e, coverage) })),
@@ -682,6 +790,7 @@ export function createServer() {
         comments: page.comments.filter((c) => !coverage.ids.has(c.id)).length,
         edits: page.edits.filter((e) => !isSentEdit(e, coverage)).length,
       },
+      ...(page.kind === "url" ? {} : threadFields(page.file)),
       canRevert: page.kind !== "url" && typeof page.pristine === "string" && page.pristine.length > 0,
       pollCommand: `${cliInvocation} poll ${shellQuote(pollTarget)}`,
     };
@@ -859,8 +968,16 @@ export function createServer() {
               res.writeHead(404, { "content-type": "text/plain" });
               return res.end("File is gone");
             }
-            // Markdown reviews render on the fly; the source file stays untouched.
+            // Markdown and LaTeX reviews render on the fly; the source stays untouched.
             if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
+            else if (isLatex(page.file)) {
+              try {
+                html = await renderLatexPage(page.file);
+              } catch (err) {
+                res.writeHead(502, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+                return res.end(`Could not render ${path.basename(page.file)}: ${err.message}`);
+              }
+            }
           }
           const headers = { "content-type": MIME[".html"], "cache-control": "no-store" };
           if (page.kind === "url") {
@@ -892,6 +1009,17 @@ export function createServer() {
       }
 
       // --- agent status probe: is feedback waiting? is anyone listening?
+      // Who this reviewer is in shared threads: a chosen name and highlight colour.
+      if (route === "/api/profile") {
+        if (req.method === "POST") {
+          const body = await readBody(req);
+          writeProfile({ name: body.name, color: body.color });
+          // Every open page shows "(you)" and the colour from the profile.
+          for (const session of sessions.values()) emit(session, "threads", { key: session.activeKey });
+        } else if (req.method !== "GET") return json(res, 405, { error: "GET or POST" });
+        return json(res, 200, { profile: readProfile(), palette: PALETTE });
+      }
+
       if (route === "/api/status" && req.method === "GET") {
         const entryKey = targetKey(url.searchParams.get("target") || url.searchParams.get("file") || "");
         const pending = batches.get(entryKey) || store.batchFromDisk(entryKey);
@@ -953,6 +1081,43 @@ export function createServer() {
           if (!comment.feedback) return json(res, 400, { error: "empty feedback" });
           store.addComment(key, comment);
           return json(res, 200, { comment, page: pageState(key) });
+        }
+
+        if (action === "thread" && req.method === "POST") {
+          const page = store.page(key);
+          if (page.kind === "url") return json(res, 400, { error: "shared threads need a file; a localhost page has nowhere to keep them" });
+          const body = await readBody(req);
+          // The browser always speaks for the person at this machine.
+          const me = humanAuthor(page.file);
+          const [id, verb] = String(tail || "").split("/");
+          try {
+            let thread = null;
+            if (verb === "fetch" || tail === "fetch") {
+              fetchRemotes(page.file);
+              notifyThreads(key);
+              return json(res, 200, { page: pageState(key) });
+            }
+            // A thread from another branch, or with replies there, comes onto
+            // this branch whole before anyone adds to it.
+            if (id && verb) adoptThread(page.file, id);
+            if (!tail) {
+              thread = createThread(page.file, {
+                kind: body.kind,
+                anchor: body.anchor,
+                replacement: body.replacement,
+                body: body.body,
+                author: me,
+                askAgent: body.askAgent,
+              });
+            } else if (verb === "reply") thread = replyToThread(page.file, id, { body: body.body, author: me });
+            else if (verb === "status") thread = setThreadStatus(page.file, id, String(body.status || ""), { author: me, note: body.note });
+            else if (verb === "ask") thread = setAskAgent(page.file, id, !!body.ask);
+            else return json(res, 404, { error: "unknown thread action" });
+            notifyThreads(key);
+            return json(res, 200, { thread, page: pageState(key) });
+          } catch (err) {
+            return json(res, 400, { error: String(err.message || err) });
+          }
         }
 
         if (action === "comment" && req.method === "DELETE") {
@@ -1046,7 +1211,7 @@ export function createServer() {
           const page = store.page(key);
           // On a plain HTML file the edits were autosaved into it; discarding
           // them means putting the agent's version back, not just dropping rows.
-          const reverted = page.kind !== "url" && !isMarkdown(page.file) && !page.dynamic && !!page.pristine;
+          const reverted = page.kind !== "url" && !isRenderedSource(page.file) && !page.dynamic && !!page.pristine;
           if (reverted) writePage(key, page.pristine);
           store.discardFeedback(key);
           for (const session of sessionsForKey(key)) emit(session, reverted ? "reload" : "refresh", reverted ? { key } : {});
@@ -1087,8 +1252,8 @@ export function createServer() {
         if (action === "save" && req.method === "POST") {
           const page = store.page(key);
           // Rendered sources must never be overwritten with serialized browser HTML.
-          if (page.kind === "url" || isMarkdown(page.file)) {
-            return json(res, 400, { error: page.kind === "url" ? "localhost edits must be applied to app source" : "markdown pages are feedback-only" });
+          if (page.kind === "url" || isRenderedSource(page.file)) {
+            return json(res, 400, { error: page.kind === "url" ? "localhost edits must be applied to app source" : "markdown and latex pages are feedback-only" });
           }
           const body = await readBody(req);
           if (typeof body.html !== "string" || !body.html.trim()) {
@@ -1119,6 +1284,14 @@ export function createServer() {
         if (action === "revert" && req.method === "POST") {
           const page = store.page(key);
           if (page.kind === "url") return json(res, 400, { error: "localhost pages have no directly writable file to revert" });
+          // Edits on a Markdown or LaTeX page were never written to its file, so
+          // there is nothing to put back. Writing `pristine` here would be wrong
+          // for LaTeX, where it holds the flattened document, not the source.
+          if (isRenderedSource(page.file)) {
+            store.clearEdits(key);
+            for (const session of sessionsForKey(key)) emit(session, "reload", { key });
+            return json(res, 200, { page: pageState(key) });
+          }
           if (!page.pristine) return json(res, 400, { error: "nothing to revert to" });
           writePage(key, page.pristine);
           store.clearEdits(key);
@@ -1200,8 +1373,8 @@ export function createServer() {
           return json(res, 200, { key: page.key, page: pageState(page.key) });
         }
         const targetFile = resolveAsset(from.file, String(body.href || "").split(/[?#]/)[0]);
-        if (!targetFile || !fs.existsSync(targetFile) || !/\.(x?html?|md|markdown)$/i.test(targetFile)) {
-          return json(res, 400, { error: "not a local html or markdown page" });
+        if (!targetFile || !fs.existsSync(targetFile) || !/\.(x?html?|md|markdown|tex)$/i.test(targetFile)) {
+          return json(res, 400, { error: "not a local html, markdown, or latex page" });
         }
         const page = openFile(targetFile);
         watchPage(page.key);
@@ -1312,7 +1485,7 @@ export function createServer() {
     for (const [key, entry] of watched) {
       const referenced = [...sessions.values()].some((s) => s.visited.has(key));
       if (!referenced) {
-        fs.unwatchFile(entry.file);
+        for (const file of entry.files) fs.unwatchFile(file);
         watched.delete(key);
         lastWritten.delete(key);
       }
@@ -1325,9 +1498,24 @@ export function createServer() {
   }, 60000);
   sweep.unref();
 
+  // Threads written outside this browser (an agent's CLI, a git pull) show up
+  // within a couple of seconds on every open page they belong to.
+  const threadWatch = setInterval(() => {
+    const keys = new Set([...sessions.values()].filter((s) => s.clients.size > 0).map((s) => s.activeKey));
+    for (const key of keys) {
+      const page = store.page(key);
+      if (!page || page.kind === "url") continue;
+      const sig = threadsSignature(page.file) + refsStamp(page.file);
+      if (!threadSigs.has(key)) threadSigs.set(key, sig);
+      else if (threadSigs.get(key) !== sig) notifyThreads(key);
+    }
+  }, THREAD_WATCH_MS);
+  threadWatch.unref();
+
   const dispose = () => {
     clearInterval(sweep);
-    for (const entry of watched.values()) fs.unwatchFile(entry.file);
+    clearInterval(threadWatch);
+    for (const entry of watched.values()) for (const file of entry.files) fs.unwatchFile(file);
     watched.clear();
     server.close();
   };

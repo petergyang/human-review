@@ -1,6 +1,6 @@
 ---
 name: human-review
-description: Open an HTML file, Markdown file, or localhost page in the browser so the user can edit text directly and leave comments on specific parts, then send all edits and comments back to you. Use after writing or updating something the user will read — specs, plans, reports, newsletter drafts, landing pages, slide decks, and locally running web pages.
+description: Open an HTML file, Markdown file, LaTeX (.tex) file, or localhost page in the browser so the user can edit text directly and leave comments on specific parts, then send all edits and comments back to you. Use after writing or updating something the user will read — specs, plans, reports, newsletter drafts, landing pages, slide decks, and locally running web pages.
 ---
 
 # human-review
@@ -12,9 +12,17 @@ Markdown files open rendered. Their quotes and edits reference the rendered text
 and the file itself is never touched — apply every change to the Markdown source,
 keeping its formatting syntax.
 
+LaTeX (`.tex`) files open the same way, rendered to HTML with [pandoc](https://pandoc.org)
+2.15 or newer (math as MathML, citations resolved from the document's `.bib` file, `\input` files
+spliced in). Open the **main** `.tex` file. Quotes and edits reference the rendered
+text, and the `.tex` files are never touched — apply every change to the LaTeX
+source, keeping its markup. Figures drawn in TikZ and other raw LaTeX are not
+rendered, only their captions. If pandoc is missing the page says so; tell the user to
+install it rather than falling back to another format.
+
 ## The loop
 
-1. Write or update the HTML or Markdown file, or start the local page being reviewed.
+1. Write or update the HTML, Markdown, or LaTeX file, or start the local page being reviewed.
 2. Open it for the user:
 
    ```sh
@@ -127,7 +135,7 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   Plain HTML files autosave as the user types, so your copy of the file is
   stale. Re-read the file before touching it and make targeted changes only;
   never regenerate it from what you wrote earlier, or their work disappears.
-  `edits_saved: false` (Markdown, localhost pages, self-rendering HTML) means the
+  `edits_saved: false` (Markdown, LaTeX, localhost pages, self-rendering HTML) means the
   edits exist only in this batch — apply them to the source yourself.
 - An edit with `kind: "deleted"` means the user removed that whole block:
   delete it from the source too, without asking why.
@@ -157,15 +165,72 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   characters and may end in `…`). An empty `moved_after` means it is now the
   first block in its container.
 - Find each comment by its `quote`. It is the **rendered** text the user
-  selected, so in Markdown or templated HTML it may span formatting syntax or
-  tags; `anchor.prefix` and `anchor.suffix` give the surrounding text to
-  disambiguate.
+  selected, so in Markdown, LaTeX, or templated HTML it may span formatting syntax,
+  macros, or tags; `anchor.prefix` and `anchor.suffix` give the surrounding text to
+  disambiguate. In LaTeX the text may live in an `\input` file, and rendered math
+  or citations (`(Smith 2020)`) are written as `$…$` or `\cite{…}` in the source.
+  After applying edits to a LaTeX project, recompile with the project's own
+  build command, since the review shows the pandoc rendering, not the PDF.
 - `kind: "element"` points at a whole block, so `quote` is its label, not body text.
 - Copy any `staged_assets` files before you ack: `--ack` deletes them.
 - A batch with only an `overall_note` has an empty `pages` array.
 - Fix every page in `pages`, not just the first.
 - **Do not write a reply.** There is no chat. The user sees your work when the page
   reloads, which happens on its own the moment you save the file.
+
+## Shared threads
+
+Besides the private feedback above, a file can carry **shared threads**: comments
+and suggested changes that every co-author and every agent reviewing it can see,
+answer, and resolve. They live beside the file, one JSON file per thread, in
+`<file>.review/` (e.g. `paper.tex.review/`), and travel between people through
+git like the file itself. Never edit that folder by hand; use these commands,
+which work whether or not a review is open (an open page updates within seconds):
+
+```sh
+npx -y human-review threads paper.tex --for-agent      # what is waiting on an agent
+npx -y human-review text paper.tex                     # the rendered text quotes must match
+npx -y human-review comment paper.tex --quote "exact rendered text" --body "…" --agent "<your name>" --model "<model id>"
+npx -y human-review suggest paper.tex --quote "old text" --replacement "new text" --body "why" --agent "<your name>" --model "<model id>"
+npx -y human-review reply paper.tex <thread-id> --body "…" --agent "<your name>" --model "<model id>"
+npx -y human-review applied paper.tex <thread-id> --agent "<your name>"
+```
+
+- Always pass `--agent` (and `--model`) when you write, so people can tell your
+  words from theirs. Without it the command writes as the human reviewer (their
+  chosen profile, else the git user). `--color '#rrggbb'` sets your highlight colour;
+  otherwise one is picked from your name.
+- Quotes are **rendered** text, as in feedback batches. If a quote appears more
+  than once, add `--prefix` or `--suffix`; if it is not found, read `text`.
+- Threads waiting on you also arrive in feedback batches under `threads`:
+  - an open thread with `ask_agent: true` asks you something. Do what it asks
+    in the source, then `reply` (replying clears the ask);
+  - a `suggestion` with `status: "accepted"` must be applied: replace its quote
+    with `replacement` in the source, then run `applied`.
+- Leave decisions to the people involved unless asked: you may `accept`,
+  `reject`, or `resolve` threads, but do so only when a human asked you to or the
+  thread is your own.
+
+### Branches, pull requests, and merge conflicts
+
+Each co-author usually works on their own branch or pull request. `threads`
+(and the review page) also show threads from other fetched branches, marked
+with the branch name; run `git fetch` first. Replying to one copies it onto
+the current branch, and it merges cleanly later.
+
+- In a repository with shared threads, run `npx -y human-review setup --git` once
+  per clone and commit the `.gitattributes` line it adds. Git then merges thread
+  files itself: replies from both sides are kept.
+- If git (or a hosting site's merge) still left conflict markers in
+  `*.review/*.json`, run `npx -y human-review fix-threads` — never hand-edit them.
+  A thread where branches made **different decisions** (one accepted, one
+  rejected) comes back open with a `conflict` note: do not pick a side; tell the
+  user which threads need a decision.
+- When the **reviewed file itself** conflicts (two branches rewrote the same
+  passage), do not silently choose. Keep one version so the file builds, then
+  post the other — or a combined wording — as a `suggest` thread on that passage
+  with `--ask-agent` off and a `--body` naming both branches, so the authors
+  accept or reject it. Tell the user each place you did this.
 
 ## Better edit labels (optional)
 

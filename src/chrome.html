@@ -22,7 +22,18 @@
         <div class="rail-head">
           <span class="section">Feedback</span>
           <span class="dim" id="count">0</span>
+          <button type="button" id="whoami" class="whoami" title="Your name and highlight colour in shared threads" hidden><span class="swatch" id="whoSwatch"></span><span id="whoName"></span></button>
           <button type="button" id="theme" class="icon-btn" title="Switch chrome to dark" aria-label="Switch chrome to dark">☾</button>
+        </div>
+
+        <div id="profileBox" class="compose profile" hidden>
+          <div class="compose-head"><span class="chip">You in shared threads</span></div>
+          <input type="text" id="profileName" maxlength="120" placeholder="Your name" spellcheck="false">
+          <div class="swatches" id="profileSwatches" role="radiogroup" aria-label="Highlight colour"></div>
+          <div class="compose-actions">
+            <button type="button" id="profileSave" class="btn-primary">Save</button>
+            <button type="button" id="profileCancel" class="btn-ghost">Cancel</button>
+          </div>
         </div>
 
         <div id="leftover" class="leftover" hidden>
@@ -40,7 +51,14 @@
               <span class="dim">Click to write · Esc to dismiss</span>
             </div>
             <p class="quote" id="composeQuote"></p>
+            <div class="modes" id="composeModes" role="group" aria-label="Who this is for" hidden>
+              <button type="button" class="mode on" data-mode="agent" title="Private feedback for your agent, sent with Send">To agent</button>
+              <button type="button" class="mode" data-mode="comment" title="A shared comment co-authors and agents can see and answer">Comment</button>
+              <button type="button" class="mode" data-mode="suggest" title="A shared suggested change others can accept or reject">Suggest</button>
+            </div>
+            <textarea id="composeReplacement" rows="3" placeholder="Replacement text" hidden></textarea>
             <textarea id="composeText" rows="3" placeholder="What should change?"></textarea>
+            <label class="ask-agent" id="askAgentRow" hidden><input type="checkbox" id="askAgent"> Ask an agent to act on this</label>
             <div class="compose-actions">
               <button type="button" id="composeAdd" class="btn-primary">Add comment <span class="key">⏎</span></button>
               <button type="button" id="composeCancel" class="btn-ghost">Cancel</button>
@@ -51,6 +69,17 @@
         <div id="cards" class="cards"></div>
 
         <div id="empty" class="empty">Select text or click an element to comment on it</div>
+
+        <section id="threadsBox" hidden>
+          <div class="rail-head tight">
+            <span class="section">Discussion</span>
+            <span class="dim" id="threadCount">0</span>
+            <button type="button" id="threadClosed" class="link-btn" hidden></button>
+            <button type="button" id="threadFetch" class="link-btn" title="git fetch, to see threads on other branches and pull requests">Fetch</button>
+          </div>
+          <div id="threadEmpty" class="empty">Shared comments and suggestions appear here for everyone reviewing this file</div>
+          <div id="threadList" class="cards"></div>
+        </section>
 
         <section id="othersBox" hidden>
           <div class="rail-head tight">
