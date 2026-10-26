@@ -35,6 +35,7 @@ let hoverMove = null; // the innermost block under the cursor, movable via the h
 let hoverMedia = null; // the img/video under the cursor, resizable via the grip
 let resizing = null; // live drag state while the grip is held
 let suppressUntil = 0; // ignore the mouseup/click that ends a resize drag
+let column = null; // { main, style, drag } once a rendered source shows the width grip
 let saveTimer = null;
 let composeOpen = false;
 /** True when the page's own scripts rewrote the DOM before any user edit. */
@@ -73,6 +74,15 @@ shadow.innerHTML = `
       background: #fff; cursor: nwse-resize; pointer-events: auto;
       box-shadow: 0 1px 4px rgba(27,26,22,.2);
     }
+    .colgrip {
+      position: fixed; z-index: 2147483645; top: 0; bottom: 0; width: 12px;
+      margin-left: -6px; display: none; cursor: ew-resize; pointer-events: auto;
+    }
+    .colgrip::after {
+      content: ""; position: absolute; left: 5px; top: 0; bottom: 0; width: 2px;
+      background: transparent; transition: background 100ms ease;
+    }
+    .colgrip:hover::after, .colgrip.dragging::after { background: #c2beb4; }
     .hint {
       position: fixed; z-index: 2147483647; display: none; padding: 3px 7px;
       border-radius: 5px; background: #1b1a16; color: #fbfaf7; white-space: nowrap;
@@ -126,6 +136,7 @@ shadow.innerHTML = `
     <button class="chip danger" id="chipDelete" title="Delete this block" aria-label="Delete this block">&#10005;</button>
   </div>
   <div class="grip" id="grip" title="Drag to resize"></div>
+  <div class="colgrip" id="colgrip" title="Drag to change the text width. Double-click to reset."></div>
   <div class="hint" id="hint"></div>
   <div class="linkbox" id="linkbox">
     <input id="linkInput" type="text" placeholder="Link to&hellip;" spellcheck="false">
@@ -146,6 +157,7 @@ const mountOverlay = () => {
   els.chips = shadow.getElementById("chips");
   els.chipDelete = shadow.getElementById("chipDelete");
   els.grip = shadow.getElementById("grip");
+  els.colgrip = shadow.getElementById("colgrip");
   els.hint = shadow.getElementById("hint");
   els.linkbox = shadow.getElementById("linkbox");
   els.linkInput = shadow.getElementById("linkInput");
@@ -752,6 +764,72 @@ function activate(id, scroll) {
     // app's inner scroll container are reached too, not just window-scrolled ones.
     target.scrollIntoView({ block: "center", behavior: "smooth" });
   }
+}
+
+// ------------------------------------------------------ reading column width
+
+/**
+ * Rendered Markdown and LaTeX read in one centred column. A grip on its right
+ * edge lets the reviewer widen or narrow it. The width lives in an SDK style
+ * tag, which serialization strips, so it never reaches the source or the batch;
+ * the chrome remembers it across reloads.
+ */
+const COLUMN_MIN = 320;
+
+function setColumnWidth(width) {
+  column.style.textContent = width ? `body > main { max-width: ${width}px !important; }` : "";
+  placeColumnGrip();
+}
+
+function placeColumnGrip() {
+  if (!column) return;
+  els.colgrip.style.left = `${Math.round(column.main.getBoundingClientRect().right)}px`;
+}
+
+function enableColumnGrip(width) {
+  const main = document.querySelector("body > main");
+  if (column || !main) return;
+  const style = document.createElement("style");
+  style.setAttribute("data-eh-sdk", "");
+  document.head.appendChild(style);
+  column = { main, style, drag: null };
+  els.colgrip.style.display = "block";
+  setColumnWidth(width);
+
+  els.colgrip.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const r = main.getBoundingClientRect();
+    // The column is centred, so dragging one edge moves both.
+    column.drag = { center: (r.left + r.right) / 2, width: r.width };
+    els.colgrip.classList.add("dragging");
+    if (els.colgrip.setPointerCapture) els.colgrip.setPointerCapture(event.pointerId);
+  });
+
+  els.colgrip.addEventListener("pointermove", (event) => {
+    if (!column.drag) return;
+    event.preventDefault();
+    const max = document.documentElement.clientWidth;
+    column.drag.width = Math.round(Math.min(max, Math.max(COLUMN_MIN, 2 * (event.clientX - column.drag.center))));
+    setColumnWidth(column.drag.width);
+  });
+
+  const finish = () => {
+    if (!column.drag) return;
+    const { width } = column.drag;
+    column.drag = null;
+    els.colgrip.classList.remove("dragging");
+    suppressUntil = Date.now() + 250;
+    post("eh:columnWidth", { width });
+  };
+  els.colgrip.addEventListener("pointerup", finish);
+  els.colgrip.addEventListener("pointercancel", finish);
+
+  els.colgrip.addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    setColumnWidth(0);
+    post("eh:columnWidth", { width: 0 });
+  });
 }
 
 // -------------------------------------------------------------------- boot
@@ -1702,6 +1780,7 @@ function boot() {
   };
   window.addEventListener("scroll", scheduleReposition, true);
   window.addEventListener("resize", scheduleReposition);
+  window.addEventListener("resize", placeColumnGrip);
 
   let scrollQueued = false;
   window.addEventListener(
@@ -1764,6 +1843,7 @@ function boot() {
         // The chrome already knows saves must not happen (e.g. a Markdown
         // source rendered for review); no comparison needed.
         dynamic = true;
+        if (msg.reading) enableColumnGrip(Number(msg.columnWidth) || 0);
         break;
       case "eh:restoreScroll":
         window.scrollTo(msg.x || 0, msg.y || 0);

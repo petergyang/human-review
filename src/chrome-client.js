@@ -695,7 +695,12 @@ window.addEventListener("message", async (event) => {
       }
       if (state.page && (state.page.markdown || state.page.feedbackOnly)) {
         // Rendered sources are editable here but never serialized over their source.
-        toFrame({ type: "eh:feedbackOnly" });
+        const reading = !!(state.page.markdown || state.page.latex);
+        let columnWidth = 0;
+        try {
+          columnWidth = Number(localStorage.getItem("human-review:columnWidth")) || 0;
+        } catch {}
+        toFrame({ type: "eh:feedbackOnly", reading, columnWidth });
       } else {
         // Hand the SDK the on-disk HTML so it can spot self-rendering pages.
         api(`/api/page/${state.key}/raw`)
@@ -784,6 +789,12 @@ window.addEventListener("message", async (event) => {
       // Serialization matched what is already on disk; nothing to write.
       state.save = state.savedAt ? "saved" : "idle";
       renderSave();
+      break;
+    case "eh:columnWidth":
+      try {
+        if (msg.width > 0) localStorage.setItem("human-review:columnWidth", String(Math.round(msg.width)));
+        else localStorage.removeItem("human-review:columnWidth");
+      } catch {}
       break;
     case "eh:dynamic":
       if (!state.dynamic) {
